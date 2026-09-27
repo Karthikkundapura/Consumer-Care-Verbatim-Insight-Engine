@@ -42,6 +42,28 @@ This plan is the single reference for that structure. It stays in force
 until the project ends. Any change to it needs a new ADR, not a silent
 edit.
 
+### Two Pipelines, Not One System
+
+The five layers above describe where code lives. They do not describe how
+data moves. Two separate flows move through those layers. Keep them
+separate in design, diagrams, and code comments, even though they share
+tables and contracts.
+
+```
+DETECTION PIPELINE (runs on a schedule, no user in the loop)
+Complaints -> Taxonomy -> Aggregation -> Poisson Scan -> Emerging Issue
+
+INVESTIGATION PIPELINE (runs on a user query)
+User Query -> Deterministic Intent Detection -> Router
+           -> Graph / SQL / Vector / Hybrid -> Evidence -> LLM Explanation
+```
+
+Both pipelines write to, or read from, the same Layer 1 tables. Both feed
+the Layer 4 Attribution UI: the Detection pipeline produces the insight
+feed, the Investigation pipeline answers a drill-down question about one
+insight. Treat a change to one pipeline as independent of the other unless
+a change touches a shared contract or table.
+
 ## 2. Repository Structure Decision
 
 **Decision: one monorepo. Not separate repositories.**
@@ -92,8 +114,9 @@ CCVIE/
 │   │       │   └── insight.py        # Claim, SourceRef, InsightResponse
 │   │       ├── data_foundation/      # Player 1 code
 │   │       │   ├── db.py             # asyncpg pool and connection helpers
-│   │       │   ├── ingestion.py      # hourly batch ingestion job
+│   │       │   ├── ingestion.py      # hourly batch ingestion job, nightly low-coverage flagging job
 │   │       │   ├── embeddings.py     # sentence-transformers wrapper
+│   │       │   ├── bertopic_enrichment.py  # daily supplemental clustering job, see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md
 │   │       │   └── queries/
 │   │       │       ├── graph_queries.py    # raw SQL: entity joins
 │   │       │       └── vector_queries.py   # raw SQL: pgvector distance queries
@@ -141,7 +164,9 @@ CCVIE/
 │   ├── migrations/                   # numbered plain SQL, applied in order
 │   │   ├── 0001_init_entities.sql
 │   │   ├── 0002_pgvector_extension_and_index.sql
-│   │   └── 0003_verbatims_and_embeddings.sql
+│   │   ├── 0003_verbatims_and_embeddings.sql
+│   │   ├── 0004_low_coverage_queue_and_taxonomy_proposals.sql   # unique index prevents duplicate queue entries
+│   │   └── 0005_insight_feedback.sql # Quality Manager decision log, see Section 7
 │   ├── seed/
 │   │   └── seed_taxonomy.sql         # static Product/Pack/Region/IssueType rows
 │   └── schema.sql                    # generated snapshot, committed, do not hand-edit
@@ -152,7 +177,7 @@ CCVIE/
 │   │   └── taxonomy_config.yaml      # shared vocabulary, mirrors db/seed/seed_taxonomy.sql
 │   ├── golden/                       # committed, small, hand-checked ground truth
 │   │   ├── planted_issue_ground_truth.json   # region, week, count, expected lead time
-│   │   ├── router_labeled_queries.json       # the 10 query pairs and the correct path
+│   │   ├── router_labeled_queries.json       # 120 query pairs (30 per route class) and the correct path
 │   │   └── eval_fixture.jsonl        # small fixed dataset, used by the CI gate
 │   └── generated/                    # gitignored, bulk output, regenerated on demand
 │       └── .gitkeep
@@ -221,6 +246,15 @@ before backend logic exists. Player 4 then builds the UI against
 file validates against the real contract class. Player 4 later swaps the
 mock for a live network call, with no type changes needed.
 
+A valid `SourceRef` ID is not proof the claim is true. Before
+`InsightResponse` leaves `retrieval_gen/api.py`, a citation validator step
+checks two things: every `SourceRef` ID exists, and every `SourceRef` ID
+belongs to the evidence set that was actually retrieved for that query
+(not just any verbatim in the database). The frontend never renders a
+verbatim string the LLM produced. It renders the verbatim text fetched
+directly from the database by ID, so a hallucinated quote cannot reach the
+Quality Manager.
+
 The database schema follows the same rule at the SQL level.
 `db/migrations/*.sql` files are the source of truth. `db/schema.sql` is a
 generated, committed snapshot. Produce it with `make db-schema-dump`, which
@@ -244,7 +278,12 @@ by layer:
 DATABASE_URL=postgresql://ccvie:ccvie@localhost:5432/ccvie
 
 # --- Embeddings (Layer 1) ---
+# EMBEDDING_DIMENSION must match the output size of EMBEDDING_MODEL_NAME.
+# all-MiniLM-L6-v2 outputs 384 dimensions, not 768. Change both values
+# together if the model changes. db/migrations/*.sql reads this pair, not
+# a hardcoded vector() width, when defining verbatim_embeddings.
 EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
+EMBEDDING_DIMENSION=384
 
 # --- LLM (Layer 3) — change the provider or model here, nowhere else ---
 LLM_PROVIDER=anthropic
@@ -260,10 +299,30 @@ ROUTER_TAXONOMY_COVERAGE_LOW=0.40
 # --- Ingestion cadence (see ADR-0003) ---
 INGESTION_CADENCE_MINUTES=60
 
+# --- Detection pipeline enrichment (Layer 1, non-blocking)
+# see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md ---
+LOW_COVERAGE_QUEUE_THRESHOLD=0.3
+BERTOPIC_RUN_THRESHOLD=50
+BERTOPIC_RUN_SCHEDULE=daily
+BERTOPIC_MAX_QUEUE_SIZE=2000
+BERTOPIC_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+BERTOPIC_RANDOM_STATE=42
+
 # --- Eval / CI gate thresholds (Layer 5) ---
+# This block is the only place a threshold value is written. Every other
+# document (docs/CCVIE_Project_26_Workflow.md, ADRs, demo slides) must
+# reference these names, never restate the number, so the docs cannot
+# drift out of sync with the gate.
+#
+# A _MIN name fails when the measured value is below it. A _MAX name
+# fails when the measured value is above it. gate.py reads the suffix to
+# pick the comparison direction; do not treat every threshold as a
+# "below threshold fails" check.
 EVAL_LEAD_TIME_REGRESSION_MAX_DAYS_DROP=1
 EVAL_CITATION_ACCURACY_MIN=0.95
 EVAL_ROUTER_ACCURACY_MIN=0.85
+EVAL_GRAPH_RECALL_MIN=0.70
+EVAL_FALSE_POSITIVE_RATE_MAX=0.15
 
 # --- Frontend, copied into frontend/.env.local by make bootstrap ---
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
@@ -291,15 +350,34 @@ model name from leaking into code where it becomes hard to change.
   to seed the data. `evaluation/lead_time.py` reads the same file to check
   detection. One file removes drift between what the team planted and what
   the team checks for.
-- `data/golden/router_labeled_queries.json` holds the ten query pairs and
-  their correct path, from Decision 1. Both the router test harness and CI
-  use this file.
+- `data/golden/router_labeled_queries.json` holds 120 query pairs and
+  their correct path: 30 Graph, 30 SQL Aggregate, 30 Vector, 30 Hybrid.
+  Include ambiguous and difficult queries (for example a comparison query
+  spanning two regions), not only obvious single-entity cases. Both the
+  router test harness and CI use this file. This is the one number for
+  the router golden set; do not restate a different count elsewhere.
 - `data/golden/eval_fixture.jsonl` is a small, fixed dataset. The CI gate
   uses this file, not the full generated dataset, so every CI run stays
   fast and repeats the same result.
 - `data/generated/` is gitignored. It holds the bulk output of
   `make gen-data`. Never commit this folder. Regenerate it at any time
   with a fixed random seed, so results stay repeatable.
+- `generate_synthetic_verbatims.py` must not generate clean taxonomy terms
+  only. Include synonyms, typos, abbreviations, short and long complaints,
+  ambiguous complaints, complaints naming more than one issue, missing
+  metadata, duplicates, and irrelevant complaints, in natural consumer
+  language (for example "lid doesn't close", "bag keeps opening", "seal
+  comes loose", not only "seal failure"). Clean-only data makes detection
+  and routing look better than they will on real complaint text.
+- Quality Manager decisions on an insight (`Confirm Issue`, `Dismiss`,
+  `False Positive`, `Investigate`) are captured, not discarded. Player 1
+  owns an `insight_feedback` table (`feedback_id`, `insight_id`,
+  `decision`, `reason`, `user_id`, `created_at`, optional `metadata jsonb`
+  for future fields) under `db/migrations/`. Use `user_id`, not an email
+  address, so the audit log stays stable if a user's email changes and
+  does not leak an email address into a table other services may read.
+  This is not part of the golden set; it is a growing feedback log the
+  evaluation harness may sample from later.
 
 ## 8. CI Gate Structure
 
@@ -321,9 +399,25 @@ runs:
 2. Apply migrations and load seed data.
 3. Load `data/golden/eval_fixture.jsonl`.
 4. Run `backend/tests/eval/*`, which call `evaluation/gate.py`.
-5. Compare the lead-time, citation-accuracy, and router-accuracy results
-   against the `EVAL_*` thresholds from `config.py`.
-6. Exit with a non-zero status if any result falls below its threshold.
+5. Compare the lead-time, citation-accuracy, router-accuracy,
+   graph-recall, and false-positive-rate results against the `EVAL_*`
+   thresholds from `config.py`. Detection quality is not only "did it
+   detect the planted issue" (recall); also check how many alerts fired
+   that were not planted issues (false-positive rate) and alerts per
+   day/week, so a noisy detector cannot pass the gate on lead time alone.
+6. Exit with a non-zero status if any `_MIN` metric falls below its
+   threshold, or any `_MAX` metric rises above its threshold (see the
+   `_MIN`/`_MAX` note in Section 6).
+
+The gate checks Poisson-based detection metrics only. The BERTopic
+enrichment job (`data_foundation/bertopic_enrichment.py`) is supplemental
+and non-blocking: its output (topics found, human reviewed, added to
+taxonomy) is reported separately and never fails `eval-gate.yml`. See
+`docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md` for the detection
+pipeline design. If the timeline runs short, cut BERTopic scope first.
+Do not remove the `low_coverage_queue` or `taxonomy_proposals` schema:
+keeping the schema costs nothing and leaves the door open to finish the
+job later.
 
 Mark both workflows as required status checks in branch protection. This
 makes the eval gate a real block on merge, not an optional report.
@@ -451,3 +545,38 @@ checks in order, once the skeleton exists.
 
 If every check above passes, the repository structure is ready for full
 layer implementation to begin.
+
+## 14. Development Phases
+
+The full architecture in this plan is larger than the timeline. Build it
+in this order. Do not start a later phase before the core end-to-end demo
+in Phase 1 through Phase 4 works.
+
+1. **Phase 1 — Core path.** Data Foundation tables, the Poisson detection
+   pipeline, evidence retrieval, the FastAPI route, and the insight feed
+   UI. This alone must run end to end before any other phase starts.
+2. **Phase 2 — Investigation pipeline.** Graph queries, vector queries,
+   and the deterministic router (Section on router intents in
+   `docs/CCVIE_Project_26_Workflow.md`).
+3. **Phase 3 — Generation and trust.** LLM synthesis and the citation
+   validator from Section 5.
+4. **Phase 4 — Evaluation and CI.** The golden sets, `eval-gate.yml`, and
+   the metrics in Section 8.
+5. **Phase 5 — BERTopic and UX polish.** The supplemental enrichment job
+   from `docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md`, the
+   top-5-then-view-all evidence UX, and the feedback buttons. Cut this
+   phase first if time runs out; it is additive, not load-bearing.
+
+## 15. Project Maturity Statement
+
+State the project's maturity honestly, in any doc or demo that discusses
+production readiness. Do not assign an arbitrary "production readiness"
+percentage.
+
+The honest framing: academically strong, architecturally
+production-minded, not yet production-proven. Production-proven requires
+evidence this two-week capstone does not produce: load testing,
+failure/recovery testing, security validation, observability, and a
+rollback demonstration. Evaluation results from Section 8 prove detection
+and routing quality; they do not by themselves prove production
+readiness.

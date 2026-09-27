@@ -1,12 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "d5ba9847bc930f0810bed2a59af78f752dae930a",
-    "indexed_at": "2026-09-26T18:21:39Z",
+    "commit": "a94fe9da0398669ca53762bb43c7ddde03b1fb6a",
+    "indexed_at": "2026-09-27T17:09:53Z",
     "project": "home-shwinaj-projects-CCVIE",
-    "nodes": 499,
-    "edges": 1238,
-    "original_size": 3276800,
-    "compressed_size": 391826,
-    "compression_level": 3,
-    "reconcile_basis": "git-clean-head"
+    "nodes": 961,
+    "edges": 2801,
+    "original_size": 5963776,
+    "compressed_size": 1098282,
+    "compression_level": 3
 }
