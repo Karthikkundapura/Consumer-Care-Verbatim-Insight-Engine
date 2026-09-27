@@ -43,13 +43,22 @@ DETECTION PIPELINE (scheduled, no user in the loop)
 Complaints -> Taxonomy -> Aggregation -> Poisson Scan -> Emerging Issue
 
 INVESTIGATION PIPELINE (fires on a user query)
-User Query -> Deterministic Intent Detection -> Router
-           -> Graph / SQL / Vector / Hybrid -> Evidence -> LLM Explanation
+User Query -> Deterministic Complexity Detector
+  Simple  -> Deterministic Intent Detection -> Router
+             -> Graph / SQL / Vector / Hybrid
+  Complex -> LLM Query Planner -> Pydantic Validation -> Approved
+             Operations -> Deterministic Plan Executor
+             -> Graph / SQL / Vector / Hybrid
+  -> Evidence -> LLM Explanation -> Citation Validation
 ```
 
 Both pipelines feed the Layer 4 Attribution UI: Detection produces the
 insight feed card, Investigation answers a drill-down question about one
-insight.
+insight. Within Investigation, Simple and Complex are also two separate
+paths: the Complex path adds a validated LLM planning step in front of
+the same deterministic execution the Simple path uses, never a
+replacement for it (see `project-architecture-proposal.md` Section 5,
+Query Planner Safety Rule).
 
 ### Layer 1: Data Foundation [Player 1]
 **Postgres + pgvector is the ONLY DB**
@@ -74,6 +83,20 @@ insight.
 **LangGraph + Pydantic**
 
 - **Input:** `QueryRequest` contract
+- **Complexity Detector (`router/complexity.py`, deterministic, unit-tested, no LLM call):**
+  runs first on every query. Signals: multiple requested actions, conjunctions
+  such as "and"/"then", investigation language, cross-region requests,
+  similarity + comparison requests, historical comparison combined with
+  another operation, multiple entities or dimensions. Default with no
+  strong signal is `Simple`. Do not build a second LLM or BERT classifier
+  to make this call.
+- **LangGraph flow:** `START -> load_context -> complexity_detector -> is_complex?`
+  - `NO  -> deterministic_router -> execute_retrieval`
+  - `YES -> query_planner -> validate_plan -> execute_plan -> collect_evidence`
+  - both branches rejoin at `-> generate -> validate_citations -> END`
+
+**Simple path**
+
 - **Features:** `entity_count`, `taxonomy_coverage`, `has_agg_word`, `has_semantic_word`
 - **Intents (deterministic, keyword/feature-based - no LLM or BERT classifier):**
   `COUNT`, `TREND`, `COMPARISON`, `ENTITY_LOOKUP`, `RELATIONSHIP`, `SEMANTIC_SEARCH`, `HYBRID`
@@ -84,20 +107,59 @@ insight.
   - **COMPARISON / HYBRID -> Route C HYBRID:** "Compare PNW seal failures vs California last month" or "Is PNW issue related elsewhere?" -> Graph + Vector, each side scoped by the entities/time window the intent extracted
   - Router stays deterministic even for `COMPARISON`: it splits the query into per-entity sub-queries by rule, not by asking an LLM to interpret it
 - **Output:** `RouteDecision` contract
+
+**Complex path - Query Planner (`router/planner.py`, `router/plan_executor.py`)**
+
+- Example: "Investigate this issue and see if similar complaints occurred in other regions."
+- **Planner:** converts the natural-language query into a validated
+  `InvestigationPlan` (`contracts/planner.py`: `original_query`,
+  `operations`, `dependencies`, `parameters`, `plan_version="1.0"`). The
+  planner determines required operations, parameters, dependencies, and
+  context. **It never executes anything.**
+- **Approved operations only:** `RESOLVE_INSIGHT`, `GET_ISSUE_DETAILS`,
+  `COUNT_COMPLAINTS`, `GET_COMPLAINT_TREND`, `SEARCH_SIMILAR_COMPLAINTS`,
+  `FIND_REGIONS`, `GROUP_BY_REGION`, `COMPARE_REGIONS`, `GET_BASELINE`,
+  `GET_HISTORICAL_BASELINE`, `GET_ISSUE_HISTORY`, `GET_PRODUCT_HISTORY`,
+  `GET_EVIDENCE`. An unknown operation is rejected, not executed.
+- **Example plan** for the query above: `RESOLVE_INSIGHT ->
+  SEARCH_SIMILAR_COMPLAINTS -> FIND_REGIONS -> GROUP_BY_REGION ->
+  COMPARE_REGIONS -> GET_EVIDENCE`.
+- **Executor (`plan_executor.py`):** accepts only a Pydantic-validated
+  `InvestigationPlan`, maps each operation to one existing retrieval
+  function (`COUNT_COMPLAINTS -> sql_queries.count_complaints()`,
+  `SEARCH_SIMILAR_COMPLAINTS -> vector_queries.search_similar_complaints()`,
+  `FIND_REGIONS -> graph_queries.find_regions()`, `GET_EVIDENCE ->
+  evidence.get_evidence()`), and rejects a plan whose `plan_version` is
+  not in `PLANNER_SUPPORTED_PLAN_VERSION`. No LLM reasoning happens here.
+- **Limits from config, never hardcoded:** `PLANNER_MAX_OPERATIONS=8`,
+  `PLANNER_MAX_EXECUTION_DEPTH=5`, `PLANNER_MAX_EXECUTION_TIME_SECONDS=15`,
+  `PLANNER_MAX_EVIDENCE_ITEMS=45` (see `project-architecture-proposal.md`
+  Section 6).
+- **Ambiguous queries** (for example "Is this getting worse?" with more
+  than one candidate issue): resolve from deterministic context where
+  possible, otherwise ask "Which issue would you like me to compare?".
+  Do not guess when ambiguity materially affects the result.
+- **Unsupported queries** (for example "What will sales be next
+  quarter?" when CCVIE has no sales data): fail safely and state what is
+  missing. Do not fabricate a result.
+- **Safety boundary:** the LLM plans only. It must never generate SQL for
+  execution, execute SQL, access PostgreSQL/pgvector/graph tables or
+  credentials directly, modify data or schema, bypass Pydantic
+  validation, or invoke arbitrary/unrestricted tools. Full rule: `project-architecture-proposal.md` Section 5, Query Planner Safety Rule.
 - **Tools:** LangGraph, Pydantic contracts in `backend/src/ccvie/contracts/`, `rules.py` thresholds from `config.py`
 
 ### Layer 3: Retrieval + Generation [Player 2]
 
-- **Retrieval:** `graph_queries.py` [PostgreSQL property graph, GraphRAG-style retrieval] + `vector_queries.py` [pgvector] - both asyncpg direct, read-only `ccvie_reader` role, NOT MCP for detection pipeline
-- **Generation:** `llm.py` thin client, provider and model name only from `LLM_PROVIDER`/`LLM_MODEL_NAME` in `config.py` (provider-agnostic, no provider or model hardcoded anywhere else), prompt in `synthesize_insight.md` -> generates `InsightResponse` with 45 `SourceRef`
-- **Citation Validation:** Retrieve evidence -> LLM generates Claim + Source IDs -> Citation Validator checks every Source ID exists and belongs to the evidence set actually retrieved for that query -> UI renders the verbatim text fetched directly from the database by ID, never the text the LLM produced, so a hallucinated quote cannot reach the Quality Manager
+- **Retrieval:** `graph_queries.py` [PostgreSQL property graph, GraphRAG-style retrieval] + `vector_queries.py` [pgvector] + `sql_queries.py` [aggregate ops, also the Complex-path executor's `COUNT_COMPLAINTS` target] - all asyncpg direct, read-only `ccvie_reader` role, NOT MCP for the detection or investigation pipeline (MCP stays out of the core path for both Simple and Complex queries; may be reconsidered later only for external agent interoperability, never added just for a demo)
+- **Generation:** `llm.py` thin client, provider and model name only from `LLM_PROVIDER`/`LLM_MODEL_NAME` in `config.py` (provider-agnostic, no provider or model hardcoded anywhere else), prompt in `synthesize_insight.md` -> generates `InsightResponse` with 45 `SourceRef`. The same generation step runs for both the Simple and Complex path, over whatever `evidence.py` assembled.
+- **Citation Validation:** Retrieve evidence -> LLM generates Claim + Source IDs -> Citation Validator (`citation_validator.py`) checks every Source ID exists and belongs to the evidence set actually retrieved for that query -> UI renders the verbatim text fetched directly from the database by ID, never the text the LLM produced, so a hallucinated quote cannot reach the Quality Manager
 - **Tools:** FastAPI, asyncpg, LLM client selected by `LLM_PROVIDER` (see `project-architecture-proposal.md` Section 6)
 
 ### Layer 4: Attribution UI [Player 4]
 **Next.js + shadcn**
 
 - **Tab 1: Insight feed** - `insight-card.tsx`, with `[Confirm Issue]` `[Dismiss]` `[False Positive]` `[Investigate]` actions that write to `insight_feedback`
-- **Tab 2: Routing proof** - shows query | intent | features | predicted vs expected route | cost G vs V [for M-4]
+- **Tab 2: Routing proof** - shows query | complexity (Simple/Complex) | intent or plan operations | features | predicted vs expected route | cost G vs V [for M-4, and plan validity for M-4b once the planner lands]
 - **Tab 3: Drill-down** - `verbatim-drilldown.tsx`, shows the top 5 strongest evidence verbatims first, with a `[View all 45]` expander for the full evidence pool (45 stays the evidence pool size, not the number shown at once) - protection against hallucination is source-ID validation and database-backed verbatim rendering (Section 3 Layer 3 Citation Validation), not a hash check: a hash only proves text is unchanged, it does not prove an LLM claim is supported by that source
 - **Tools:** Next.js 14, shadcn/ui, types generated from `/openapi.json`
 
@@ -108,6 +170,7 @@ insight.
 - `planted_issue_ground_truth.json` [20 planted issues]
 - `router_golden.jsonl` [120 queries, 2 annotators, kappa>0.65] - THIS WAS MISSING = M-4 CRITICAL
 - `eval_fixture.jsonl` [30 queries for citation]
+- complex investigation golden set (new, additional to router_golden.jsonl, feeds M-4b): multi-region investigation, similar-complaint investigation, historical comparison, trend + comparison, ambiguous queries, unsupported queries, missing-context queries, multi-step evidence requests
 
 **Metrics:**
 - M-1 Detection Rate (Recall - did it catch the planted issue)
@@ -115,11 +178,14 @@ insight.
 - M-1c Alerts per day/week - answers "does this create alert fatigue"
 - M-2 Lead Time vs monthly baseline (Time-to-detection)
 - M-3 Citation Accuracy [ID match + evidence-set membership from the Citation Validator, Section 3 Layer 3 + optional RAGAS faithfulness offline]
-- M-4 Routing Correctness [accuracy + per-class recall, per intent]
-- E13 Cost/query
+- M-4 Routing Correctness [accuracy + per-class recall, per intent] - Simple path only, unchanged by the planner addition
+- M-4b Investigation Plan Validity (Complex path, `planner_eval.py`): Valid Plan Rate, Operation Validity, Parameter Completeness, Plan Execution Success Rate, Unsupported Operation Rejection
+- E13 Cost/query - split into `PLANNER_LLM_COST` + `RETRIEVAL_COST` + `EXECUTION_COST` + `GENERATION_COST` = `TOTAL_QUERY_COST` for the Complex path; track Simple- and Complex-path cost separately, do not treat them as equivalent without identifying the query path
 - E14 Latency p50/p95
 
-**Gates:** `eval-gate.yml` fails the PR if any `_MIN` metric (citation accuracy, router accuracy, graph recall) falls below its threshold, or any `_MAX` metric (lead-time regression days, false-positive rate) rises above its threshold - see `project-architecture-proposal.md` Section 6 for the one source of truth on those `EVAL_*` values and the `_MIN`/`_MAX` direction. These checks cover the Poisson-based metrics only. The BERTopic enrichment job is supplemental: its results (topics found, human reviewed, added to taxonomy) are reported alongside the gate output but never block it.
+**Gates:** `eval-gate.yml` fails the PR if any `_MIN` metric (citation accuracy, router accuracy, graph recall) falls below its threshold, or any `_MAX` metric (lead-time regression days, false-positive rate) rises above its threshold - see `project-architecture-proposal.md` Section 6 for the one source of truth on those `EVAL_*` values and the `_MIN`/`_MAX` direction. These checks cover the Poisson-based metrics only. The BERTopic enrichment job is supplemental: its results (topics found, human reviewed, added to taxonomy) are reported alongside the gate output but never block it. M-4b is reported the same way once the planner lands: visible in gate output, not blocking, until the team locks an `EVAL_PLANNER_*` threshold (Section 8).
+
+**Observability (Complex path):** log `request_id`, `query_complexity`, `selected_path`, `planner_model`, `plan_version`, `operations`, `validation_result`, `execution_duration`, `evidence_count`, `citation_validation_result`, `planner_llm_cost`, `execution_cost`, `total_query_cost`, `final_status`. Do not log unnecessary sensitive complaint content.
 
 **Tools:** Pytest, GitHub Actions, RAGAS offline only [not in CI]
 
@@ -136,6 +202,7 @@ insight.
 | **FastAPI + asyncpg** | API + direct SQL, read-only role | Faster than MCP for detection, MCP optional only for ad-hoc tab |
 | **sentence-transformers** | Embeddings, no LLM call in detection | Keeps cost low per blueprint page 63; model + dimension pinned together in `config.py` |
 | **LLM_PROVIDER / LLM_MODEL_NAME** | Provider-agnostic LLM client for Layer 3 generation only | No provider or model name hardcoded outside `config.py`/`.env*`, required by proposal Section 6 |
+| **Deterministic complexity detector + LLM Query Planner** | Plans, never executes, a Complex investigation query; Simple queries never reach it | Keeps the deterministic router as the default path; LLM never touches SQL/graph/vector directly, see proposal Section 5 |
 | **Next.js + shadcn** | UI with attribution | Required for citation drill-down |
 | **Pytest + eval-gate** | CI that blocks regression | Proves M-1 to M-4 reliably, thresholds from `config.py` only |
 
@@ -147,22 +214,38 @@ insight.
 DETECTION: Consumer text -> ingestion.py -> graph_nodes/edges + embedding
   -> Poisson scan detects spike in 3 days -> Emerging Issue card in UI
 
-INVESTIGATION: Quality Manager query -> Deterministic Intent Detection
-  -> Router decides Graph vs Vector vs Hybrid -> Retrieval gets 45
-  verbatims -> LLM generates insight with SourceRef -> Citation Validator
-  checks IDs -> UI shows top 5 + [View all 45], verbatim text from DB
-  -> Quality Manager records Confirm/Dismiss/False Positive/Investigate
-  -> Evaluation reports the measured lead-time improvement, routing
-  accuracy, false-positive rate, and cost/query from that run (all
-  thresholds from config.py; these are measured values, not fixed demo
-  numbers, and will change as the implementation changes)
+INVESTIGATION (Simple): Quality Manager query -> Complexity Detector
+  says Simple -> Deterministic Intent Detection -> Router decides Graph
+  vs Vector vs Hybrid -> Retrieval gets 45 verbatims -> LLM generates
+  insight with SourceRef -> Citation Validator checks IDs -> UI shows
+  top 5 + [View all 45], verbatim text from DB -> Quality Manager
+  records Confirm/Dismiss/False Positive/Investigate -> Evaluation
+  reports the measured lead-time improvement, routing accuracy,
+  false-positive rate, and cost/query from that run (all thresholds from
+  config.py; these are measured values, not fixed demo numbers, and will
+  change as the implementation changes)
+
+INVESTIGATION (Complex): "Investigate this issue and see if similar
+  complaints occurred in other regions." -> Complexity Detector says
+  Complex -> LLM Query Planner produces InvestigationPlan
+  (RESOLVE_INSIGHT -> SEARCH_SIMILAR_COMPLAINTS -> FIND_REGIONS ->
+  GROUP_BY_REGION -> COMPARE_REGIONS -> GET_EVIDENCE) -> Pydantic
+  validation + approved-operations check -> plan_executor.py runs each
+  operation deterministically (Vector for similar complaints, SQL/Graph
+  for regional grouping and comparison, PostgreSQL for evidence) -> same
+  Generation + Citation Validation + UI as the Simple path -> Evaluation
+  reports M-4b plan validity plus the Complex-path cost breakdown
+  (PLANNER_LLM_COST + RETRIEVAL_COST + EXECUTION_COST + GENERATION_COST)
 ```
 
 ## 6. Delivery Phases and Maturity
 
 Build in the phase order in `project-architecture-proposal.md` Section 14:
-core detection-to-UI path first, then the investigation pipeline, then
-generation/citation trust, then evaluation/CI, then BERTopic and UX
-polish last. Do not claim this system is production-proven; state its
-maturity the way Section 15 of that document states it, on the panel and
-in any status update.
+core detection-to-UI path first, then the investigation pipeline
+(Simple-path router, then the complexity detector and Query Planner for
+the Complex path), then generation/citation trust, then evaluation/CI,
+then BERTopic and UX polish last. The Query Planner is Phase 2; do not
+let its implementation delay the Phase 1 Data -> Detection -> Evidence ->
+API -> UI milestone. Do not claim this system is production-proven; state
+its maturity the way Section 15 of that document states it, on the panel
+and in any status update.

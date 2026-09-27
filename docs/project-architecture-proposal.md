@@ -54,8 +54,12 @@ DETECTION PIPELINE (runs on a schedule, no user in the loop)
 Complaints -> Taxonomy -> Aggregation -> Poisson Scan -> Emerging Issue
 
 INVESTIGATION PIPELINE (runs on a user query)
-User Query -> Deterministic Intent Detection -> Router
-           -> Graph / SQL / Vector / Hybrid -> Evidence -> LLM Explanation
+User Query -> Deterministic Complexity Detector
+  Simple  -> Deterministic Router -> Graph / SQL / Vector / Hybrid
+  Complex -> LLM Query Planner -> Pydantic Validation -> Approved
+             Operations -> Deterministic Plan Executor
+             -> Graph / SQL / Vector / Hybrid
+  -> Evidence -> LLM Explanation -> Citation Validation
 ```
 
 Both pipelines write to, or read from, the same Layer 1 tables. Both feed
@@ -63,6 +67,12 @@ the Layer 4 Attribution UI: the Detection pipeline produces the insight
 feed, the Investigation pipeline answers a drill-down question about one
 insight. Treat a change to one pipeline as independent of the other unless
 a change touches a shared contract or table.
+
+Inside the Investigation pipeline, a Simple query and a Complex query are
+also two separate paths, not one system. Section 5's Query Planner Safety
+Rule states why: the Complex path adds a validated LLM planning step in
+front of the same deterministic execution the Simple path already uses,
+never a replacement for it.
 
 ## 2. Repository Structure Decision
 
@@ -111,7 +121,8 @@ CCVIE/
 │   │       │   ├── entities.py       # Product, Pack, Region, IssueType, DatePeriod
 │   │       │   ├── query.py          # QueryRequest
 │   │       │   ├── router.py         # RouterFeatures, RouteDecision
-│   │       │   └── insight.py        # Claim, SourceRef, InsightResponse
+│   │       │   ├── insight.py        # Claim, SourceRef, InsightResponse
+│   │       │   └── planner.py        # InvestigationPlan, InvestigationOperation, OperationType, see Query Planner Safety Rule
 │   │       ├── data_foundation/      # Player 1 code
 │   │       │   ├── db.py             # asyncpg pool and connection helpers
 │   │       │   ├── ingestion.py      # hourly batch ingestion job, nightly low-coverage flagging job
@@ -119,21 +130,28 @@ CCVIE/
 │   │       │   ├── bertopic_enrichment.py  # daily supplemental clustering job, see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md
 │   │       │   └── queries/
 │   │       │       ├── graph_queries.py    # raw SQL: entity joins
-│   │       │       └── vector_queries.py   # raw SQL: pgvector distance queries
+│   │       │       ├── vector_queries.py   # raw SQL: pgvector distance queries
+│   │       │       └── sql_queries.py      # raw SQL: aggregate ops (COUNT_COMPLAINTS etc.), same read-only ownership as the two files above
 │   │       ├── router/               # Player 2 code, Layer 2
-│   │       │   ├── graph.py          # the thin LangGraph node graph
+│   │       │   ├── graph.py          # the thin LangGraph node graph, see the complexity-branch flow in Section 5
 │   │       │   ├── features.py       # entity_count, word_count, taxonomy_coverage
-│   │       │   └── rules.py          # threshold rules, values pulled from config
+│   │       │   ├── rules.py          # threshold rules, values pulled from config
+│   │       │   ├── complexity.py     # deterministic Simple vs Complex detector, unit-tested, no LLM call
+│   │       │   ├── planner.py        # LLM Query Planner: query -> InvestigationPlan, planning only, never executes
+│   │       │   └── plan_executor.py  # deterministic executor, accepts only a validated InvestigationPlan
 │   │       ├── retrieval_gen/        # Player 2 code, Layer 3
 │   │       │   ├── api.py            # FastAPI app and route handlers
 │   │       │   ├── orchestrator.py   # hybrid retrieval orchestration
 │   │       │   ├── llm.py            # thin LLM client, model name from config only
+│   │       │   ├── evidence.py       # evidence assembly, shared by the Simple and Complex paths
+│   │       │   ├── citation_validator.py  # Source ID existence + evidence-set membership check, see Section 5
 │   │       │   └── prompts/
 │   │       │       └── synthesize_insight.md
 │   │       └── evaluation/           # Player 3 code, Layer 5 harness
 │   │           ├── simulate.py       # replays synthetic data over simulated time
 │   │           ├── lead_time.py      # lead time vs. naive monthly baseline
 │   │           ├── scoring.py        # citation accuracy, router accuracy
+│   │           ├── planner_eval.py   # M-4b Investigation Plan Validity, see Section 7
 │   │           └── gate.py           # CI gate entry point
 │   └── tests/
 │       ├── unit/
@@ -261,6 +279,58 @@ generated, committed snapshot. Produce it with `make db-schema-dump`, which
 runs `pg_dump --schema-only` against the local database. Any reader, human
 or agent, can open this one file to see the current table structure.
 
+### Query Planner Safety Rule
+
+A Complex investigation query (Section 1's "Two Pipelines") does not skip
+the rules above. It adds one more validated hop in front of them.
+
+**Rule: the LLM Query Planner may only plan. It never executes a query.**
+
+```
+LLM Planner -> InvestigationPlan -> Pydantic Validation
+            -> Approved Operations -> Deterministic Executor
+            -> SQL / Graph / Vector / Hybrid
+```
+
+`backend/src/ccvie/contracts/planner.py` defines `InvestigationPlan`,
+`InvestigationOperation`, and `OperationType`. A plan carries
+`original_query`, `operations`, `dependencies`, `parameters`, and
+`plan_version`. The initial `plan_version` is `"1.0"`.
+
+`router/plan_executor.py` accepts only an `InvestigationPlan` that passed
+Pydantic validation. It maps each operation to one existing retrieval
+function and contains no LLM reasoning, for example:
+
+```
+COUNT_COMPLAINTS          -> sql_queries.count_complaints()
+SEARCH_SIMILAR_COMPLAINTS -> vector_queries.search_similar_complaints()
+FIND_REGIONS              -> graph_queries.find_regions()
+GET_EVIDENCE              -> evidence.get_evidence()
+```
+
+The planner may use only this approved operation vocabulary:
+
+```
+RESOLVE_INSIGHT, GET_ISSUE_DETAILS, COUNT_COMPLAINTS,
+GET_COMPLAINT_TREND, SEARCH_SIMILAR_COMPLAINTS, FIND_REGIONS,
+GROUP_BY_REGION, COMPARE_REGIONS, GET_BASELINE,
+GET_HISTORICAL_BASELINE, GET_ISSUE_HISTORY, GET_PRODUCT_HISTORY,
+GET_EVIDENCE
+```
+
+`plan_executor.py` rejects any operation name outside this list, and never
+silently runs a plan whose `plan_version` is not in
+`PLANNER_SUPPORTED_PLAN_VERSION` (Section 6). The LLM must never: generate
+SQL for execution, execute SQL, access PostgreSQL, pgvector, or graph
+tables directly, access credentials, modify data or schema, bypass
+Pydantic validation, invoke arbitrary tools, or invoke unrestricted
+external services.
+
+A breaking change to `InvestigationPlan` or to operation semantics needs
+all of: an incremented `plan_version`, updated Pydantic contracts, updated
+executor compatibility, an updated planner prompt/schema, updated planner
+golden tests, updated evaluation fixtures, and a new ADR.
+
 ## 6. Configuration Rule
 
 **Rule: one settings object holds every configuration value. No file reads
@@ -295,6 +365,15 @@ ROUTER_WORD_COUNT_LOW=50
 ROUTER_WORD_COUNT_HIGH=150
 ROUTER_TAXONOMY_COVERAGE_HIGH=0.80
 ROUTER_TAXONOMY_COVERAGE_LOW=0.40
+
+# --- Query Planner (Layer 2/3, Complex investigation path only,
+# see the Query Planner Safety Rule in Section 5) ---
+PLANNER_ENABLED=true
+PLANNER_MAX_OPERATIONS=8
+PLANNER_MAX_EXECUTION_DEPTH=5
+PLANNER_MAX_EXECUTION_TIME_SECONDS=15
+PLANNER_MAX_EVIDENCE_ITEMS=45
+PLANNER_SUPPORTED_PLAN_VERSION=1.0
 
 # --- Ingestion cadence (see ADR-0003) ---
 INGESTION_CADENCE_MINUTES=60
@@ -378,6 +457,13 @@ model name from leaking into code where it becomes hard to change.
   does not leak an email address into a table other services may read.
   This is not part of the golden set; it is a growing feedback log the
   evaluation harness may sample from later.
+- A separate golden set of complex investigation queries feeds M-4b
+  (Section 8): multi-region investigation, similar-complaint
+  investigation, historical comparison, trend plus comparison, ambiguous
+  queries, unsupported queries, missing-context queries, and multi-step
+  evidence requests. This set is additional to, not a replacement for,
+  the 120-query router golden set above; router evaluation stays
+  unchanged.
 
 ## 8. CI Gate Structure
 
@@ -418,6 +504,15 @@ pipeline design. If the timeline runs short, cut BERTopic scope first.
 Do not remove the `low_coverage_queue` or `taxonomy_proposals` schema:
 keeping the schema costs nothing and leaves the door open to finish the
 job later.
+
+Once the Query Planner (Phase 2, Section 14) exists, `evaluation/gate.py`
+also reports M-4b Investigation Plan Validity: valid plan rate, operation
+validity, parameter completeness, plan execution success rate, and
+unsupported-operation rejection rate, from the complex investigation
+golden set in Section 7. Report M-4b in the gate output as soon as the
+planner lands; do not block a merge on it until the team locks an
+`EVAL_PLANNER_*` threshold in this config, the same way every other gate
+metric is locked here first.
 
 Mark both workflows as required status checks in branch protection. This
 makes the eval gate a real block on merge, not an optional report.
@@ -467,6 +562,14 @@ state, in this order:
      graph over fixed threshold rules.
    - Do not commit files under `data/generated/`. That folder is
      gitignored on purpose.
+8. **Query Planner warnings**, once Phase 2 (Section 14) lands, each as
+   one sentence:
+   - Do not let the Complex path replace the deterministic router. Only
+     a query the complexity detector classifies Complex reaches the
+     planner.
+   - Do not let the LLM execute SQL or touch the database directly. It
+     may only produce a validated `InvestigationPlan`, per the Query
+     Planner Safety Rule in Section 5.
 
 Keep `CLAUDE.md` under one page. Update it only when a rule in this plan
 changes, and record that change as a new ADR.
@@ -557,7 +660,12 @@ in Phase 1 through Phase 4 works.
    UI. This alone must run end to end before any other phase starts.
 2. **Phase 2 — Investigation pipeline.** Graph queries, vector queries,
    and the deterministic router (Section on router intents in
-   `docs/CCVIE_Project_26_Workflow.md`).
+   `docs/CCVIE_Project_26_Workflow.md`) for the Simple path; the
+   deterministic complexity detector, LLM Query Planner, Pydantic plan
+   validation, and `plan_executor.py` (Section 5's Query Planner Safety
+   Rule) for the Complex path. Do not let Query Planner work delay the
+   Phase 1 milestone; land the Simple path and the planner's safety
+   boundary before polishing complex-query coverage.
 3. **Phase 3 — Generation and trust.** LLM synthesis and the citation
    validator from Section 5.
 4. **Phase 4 — Evaluation and CI.** The golden sets, `eval-gate.yml`, and
