@@ -152,9 +152,9 @@ Query Planner Safety Rule).
   validation, or invoke arbitrary/unrestricted tools. Full rule: `project-architecture-proposal.md` Section 5, Query Planner Safety Rule.
 - **Tools:** LangGraph, Pydantic contracts in `backend/src/ccvie/contracts/`, `rules.py` thresholds from `config.py`
 
-### Layer 3: Retrieval + Generation [Player 2]
+### Layer 3: Retrieval + Generation [Player 1: retrieval primitives; Player 2: orchestration, generation, citation validation]
 
-- **Retrieval:** `graph_queries.py` [PostgreSQL-based relational property-graph model, GraphRAG-style retrieval, multi-hop example `Issue -> Pack -> Region -> Related Issue`] + `vector_queries.py` [pgvector] + `sql_queries.py` [aggregate ops, also the Complex-path executor's `COUNT_COMPLAINTS` target] - all asyncpg direct, read-only `ccvie_reader` role, NOT MCP for the detection or investigation pipeline (MCP stays out of the core path for both Simple and Complex queries; may be reconsidered later only for external agent interoperability, never added just for a demo)
+- **Retrieval (Player 1 implements and optimizes; files live in `retrieval_gen/`, not moved into `data_foundation/` just to match ownership):** `graph_queries.py` [PostgreSQL-based relational property-graph model, GraphRAG-style retrieval, multi-hop example `Issue -> Pack -> Region -> Related Issue`] + `vector_queries.py` [pgvector] + `sql_queries.py` [aggregate ops, also the Complex-path executor's `COUNT_COMPLAINTS` target] - all asyncpg direct, read-only `ccvie_reader` role, NOT MCP for the detection or investigation pipeline (MCP stays out of the core path for both Simple and Complex queries; may be reconsidered later only for external agent interoperability, never added just for a demo). Player 2's `orchestrator.py` and `plan_executor.py` consume these as a dependency: `Player 1 -> Data + Retrieval Primitives -> Player 2 -> Planning + Orchestration + Generation`.
 - **Generation:** `llm.py` thin client, provider and model name only from `LLM_PROVIDER`/`LLM_MODEL_NAME` in `config.py` (provider-agnostic, no provider or model hardcoded anywhere else), prompt in `synthesize_insight.md` -> generates `InsightResponse` with up to `MAX_EVIDENCE_ITEMS` (45) `SourceRef` - a cap, not a required count. The same generation step runs for both the Simple and Complex path, over whatever `evidence.py` assembled.
 - **Evidence Limit:** `top_k <= MAX_EVIDENCE_ITEMS`: 18 matches -> return 18, 45 matches -> return 45, 250 matches -> retrieve/rank the top 45. Never assume exactly 45.
 - **Citation Validation:** Retrieve evidence -> LLM generates Claim + Source IDs -> Citation Validator (`citation_validator.py`) checks every citation the response actually used exists and belongs to the evidence set actually retrieved for that query, whatever its size -> UI renders the verbatim text fetched directly from the database by ID, never the text the LLM produced, so a hallucinated quote cannot reach the Quality Manager
@@ -252,18 +252,30 @@ INVESTIGATION (Complex): "Investigate this issue and see if similar
 ## 6. Delivery Phases and Maturity
 
 Build in the phase order in `project-architecture-proposal.md` Section 14:
-core detection-to-UI path first, then the investigation pipeline
-(Simple-path router, then the complexity detector and Query Planner for
-the Complex path), then generation/citation trust, then evaluation/CI,
-then BERTopic and UX polish last. The Query Planner is Phase 2; do not
-let its implementation delay the Phase 1 Data -> Detection -> Evidence ->
-API -> UI milestone. Do not claim this system is production-proven; state
-its maturity the way Section 15 of that document states it, on the panel
-and in any status update.
+`Data -> Detection -> Retrieval -> Evidence -> API -> UI` is Phase 1,
+goal a working end-to-end local demo, and it already includes the
+Simple-path deterministic router and its graph/vector/SQL retrieval.
+Phase 2 is the Query Planner only: complexity detector -> Query Planner
+-> plan validation -> controlled plan executor -> complex investigation
+evaluation. Then generation/citation trust, then evaluation/CI, then
+BERTopic and UX polish last. Do not let Phase 2 delay the Phase 1
+milestone. Do not claim this system is production-proven; state its
+maturity the way Section 15 of that document states it, on the panel and
+in any status update.
 
-This capstone demonstrates locally. Per the Scope Decision in
-`project-architecture-proposal.md` Section 2, do not spend remaining
-time on cloud deployment, canary deployment, or rollback implementation;
-put it into GraphRAG correctness, low-volume detection, evidence limits,
-the Query Planner, evaluation, security boundaries, and local demo
-reliability instead.
+Before the final demo, confirm the Final Engineering Evidence checklist
+(`project-architecture-proposal.md` Section 14) is in place: local health
+checks, the rollback demonstration (`scripts/demo_rollback.sh`), the
+operating runbook (`docs/runbook.md`), the agent review log
+(`docs/AGENT_REVIEW_LOG.md`), security evidence (Query Planner Safety
+Rule, citation validation), and evaluation evidence (the gate output,
+M-1 through M-4b).
+
+This capstone demonstrates on a local, non-production Docker environment,
+with a reproducible rollback demonstration. Per the Scope Decision in
+`project-architecture-proposal.md` Section 2, do not add AWS, Azure,
+Kubernetes, cloud deployment, or canary/production infrastructure; the
+rollback demonstration stays a local Docker script, not a deployment
+pipeline. Put remaining time into GraphRAG correctness, low-volume
+detection, evidence limits, the Query Planner, evaluation, security
+boundaries, and local demo reliability instead.

@@ -162,13 +162,20 @@ Reasons:
 Do not add Nx, Turborepo, Kubernetes, or a service mesh to this project.
 These tools solve problems this project does not have.
 
-**Scope decision: this capstone demonstrates locally.** Do not add cloud
-deployment, canary deployment, or rollback implementation to the current
-scope. Spend remaining engineering time on GraphRAG correctness,
-low-volume detection, evidence limits, the Query Planner, evaluation,
-security boundaries, and local demo reliability — not on infrastructure
-this two-week project does not need. Section 15 states the resulting
-maturity honestly.
+**Scope decision: this capstone demonstrates on a local, non-production
+Docker environment, with a reproducible rollback demonstration.** Do not
+add AWS, Azure, Kubernetes, cloud deployment, canary infrastructure, or
+production deployment infrastructure. The capstone requirements do call
+for non-production deployment, health checks, a demonstrated rollback,
+and an operating runbook; `scripts/demo_rollback.sh` and the rollback
+procedure in `docs/runbook.md` (Section 11) satisfy that requirement at
+local-Docker scale — this is a demonstration script, not a deployment
+pipeline, and it stays out of scope for anything beyond `docker run`/
+`docker compose` on one machine. Spend remaining engineering time on
+GraphRAG correctness, low-volume detection, evidence limits, the Query
+Planner, evaluation, security boundaries, and local demo reliability —
+not on cloud infrastructure this two-week project does not need. Section
+15 states the resulting maturity honestly.
 
 ## 3. Full Folder Tree
 
@@ -198,11 +205,7 @@ CCVIE/
 │   │       │   ├── ingestion.py      # hourly batch ingestion job, nightly low-coverage flagging job
 │   │       │   ├── detection.py      # Poisson scan + low-volume detection policy, see Section 1
 │   │       │   ├── embeddings.py     # sentence-transformers wrapper
-│   │       │   ├── bertopic_enrichment.py  # daily supplemental clustering job, see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md
-│   │       │   └── queries/
-│   │       │       ├── graph_queries.py    # raw SQL: entity joins
-│   │       │       ├── vector_queries.py   # raw SQL: pgvector distance queries
-│   │       │       └── sql_queries.py      # raw SQL: aggregate ops (COUNT_COMPLAINTS etc.), same read-only ownership as the two files above
+│   │       │   └── bertopic_enrichment.py  # daily supplemental clustering job, see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md
 │   │       ├── router/               # Player 2 code, Layer 2
 │   │       │   ├── graph.py          # the thin LangGraph node graph, see the complexity-branch flow in Section 5
 │   │       │   ├── features.py       # entity_count, word_count, taxonomy_coverage
@@ -210,12 +213,15 @@ CCVIE/
 │   │       │   ├── complexity.py     # deterministic Simple vs Complex detector, unit-tested, no LLM call
 │   │       │   ├── planner.py        # LLM Query Planner: query -> InvestigationPlan, planning only, never executes
 │   │       │   └── plan_executor.py  # deterministic executor, accepts only a validated InvestigationPlan
-│   │       ├── retrieval_gen/        # Player 2 code, Layer 3
-│   │       │   ├── api.py            # FastAPI app and route handlers
-│   │       │   ├── orchestrator.py   # hybrid retrieval orchestration
-│   │       │   ├── llm.py            # thin LLM client, model name from config only
-│   │       │   ├── evidence.py       # evidence assembly, shared by the Simple and Complex paths
-│   │       │   ├── citation_validator.py  # Source ID existence + evidence-set membership check, see Section 5
+│   │       ├── retrieval_gen/        # Layer 3; split ownership, see Section 4
+│   │       │   ├── graph_queries.py       # raw SQL: entity joins [Player 1 implements]
+│   │       │   ├── vector_queries.py      # raw SQL: pgvector distance queries [Player 1 implements]
+│   │       │   ├── sql_queries.py         # raw SQL: aggregate ops, e.g. COUNT_COMPLAINTS [Player 1 implements]
+│   │       │   ├── api.py            # FastAPI app and route handlers [Player 2]
+│   │       │   ├── orchestrator.py   # hybrid retrieval orchestration, consumes the three query files above [Player 2]
+│   │       │   ├── llm.py            # thin LLM client, model name from config only [Player 2]
+│   │       │   ├── evidence.py       # evidence assembly, shared by the Simple and Complex paths [Player 2]
+│   │       │   ├── citation_validator.py  # Source ID existence + evidence-set membership check, see Section 5 [Player 2]
 │   │       │   └── prompts/
 │   │       │       └── synthesize_insight.md
 │   │       └── evaluation/           # Player 3 code, Layer 5 harness
@@ -273,13 +279,16 @@ CCVIE/
 ├── docs/
 │   ├── architecture.md               # the living architecture doc, see Section 9
 │   ├── api-contract.md               # points to code and to /openapi.json, no field copies
-│   ├── runbook.md                    # local setup steps and demo-day steps
+│   ├── runbook.md                    # local setup steps, demo-day steps, and the rollback procedure, see Section 11
 │   ├── demo-script.md                # panel walkthrough talking points
+│   ├── AGENT_REVIEW_LOG.md           # agent-generated changes and human review, see Section 9
 │   └── adr/
 │       ├── template.md
 │       ├── 0001-router-threshold-rules.md
 │       ├── 0002-planted-issue-design.md
 │       └── 0003-ingestion-cadence.md
+├── scripts/
+│   └── demo_rollback.sh              # local Docker rollback demonstration, see Section 11
 ├── docker-compose.yml                # postgres+pgvector, backend, frontend
 ├── .env.example                      # every env var used anywhere in the system
 ├── .gitignore
@@ -294,16 +303,45 @@ Each player owns one set of folders. Ownership means that player merges
 changes to that folder. Other players may propose changes there, but the
 owner approves them.
 
-| Player | Owned folders |
+| Player | Ownership |
 |---|---|
-| Player 1 (Data Foundation) | `db/migrations/`, `db/seed/`, `backend/src/ccvie/data_foundation/` |
-| Player 2 (Router, Retrieval, Generation) | `backend/src/ccvie/router/`, `backend/src/ccvie/retrieval_gen/`, joint ownership of `backend/src/ccvie/contracts/` |
-| Player 3 (Data, Evaluation) | `data/generators/`, `data/golden/`, `backend/src/ccvie/evaluation/`, `backend/tests/eval/`, `.github/workflows/eval-gate.yml` |
-| Player 4 (Frontend, Attribution UI) | `frontend/`, `docs/demo-script.md` |
+| Player 1 | Data Foundation, DB migrations/seeding, SQL queries, Graph queries, Vector queries |
+| Player 2 | Complexity Detector, Deterministic Router, Query Planner, Plan Executor, LangGraph orchestration, Generation, Citation Validation |
+| Player 3 | Evaluation datasets, evaluation harness, metrics, CI evaluation gates |
+| Player 4 | Frontend, Insight UI, Investigation UI, Routing Proof UI, Attribution/Evidence UI |
 
-`backend/src/ccvie/contracts/` has two owners: Player 2 and Player 4. Lock
-its first version on Day 1, before other backend code exists. Treat any
-later change to a contract file as a change both owners must approve.
+Ownership is by responsibility, not only by folder, because
+`backend/src/ccvie/retrieval_gen/` now holds files from two owners:
+
+- Player 1 implements and optimizes `graph_queries.py`, `vector_queries.py`,
+  and `sql_queries.py` — the retrieval primitives. These files stay in
+  `retrieval_gen/`, next to the code that calls them; do not move them
+  into `data_foundation/` merely to make ownership match folder location.
+- Player 2 implements everything else in `retrieval_gen/` (`api.py`,
+  `orchestrator.py`, `llm.py`, `evidence.py`, `citation_validator.py`) plus
+  all of `backend/src/ccvie/router/`, and consumes Player 1's retrieval
+  primitives as a dependency, not as code Player 2 also owns:
+
+```
+Player 1
+    ↓
+Data + Retrieval Primitives
+    ↓
+Player 2
+Planning + Orchestration + Generation
+```
+
+Treat a pull request touching `graph_queries.py`, `vector_queries.py`, or
+`sql_queries.py` as Player 1's to approve, even though the file lives
+inside a folder Player 2 also commits to. `db/migrations/`, `db/seed/`,
+and `backend/src/ccvie/data_foundation/` remain entirely Player 1's, as
+before.
+
+`backend/src/ccvie/contracts/` keeps its existing rule, unchanged by the
+Query Planner's `planner.py` addition: it has two owners, Player 2 and
+Player 4. Lock its first version on Day 1, before other backend code
+exists. Treat any later change to a contract file, including `planner.py`,
+as a change both owners must approve.
 
 ## 5. Shared Contract Rule
 
@@ -643,8 +681,18 @@ makes the eval gate a real block on merge, not an optional report.
   `backend/src/ccvie/contracts/` and to the live `/openapi.json` file. It
   does not restate field names, so it cannot drift out of sync with the
   code.
-- `docs/runbook.md` holds local setup steps. `docs/demo-script.md` holds
-  the panel-day walkthrough.
+- `docs/runbook.md` holds local setup steps, the rollback procedure
+  (`scripts/demo_rollback.sh`, Section 11), and demo-day steps.
+  `docs/demo-script.md` holds the panel-day walkthrough.
+- `docs/AGENT_REVIEW_LOG.md` records agent-generated changes and their
+  human review: date, area, prompt/instruction, agent change, review
+  finding, action taken, test/CI evidence. `docs/AGENT_REVIEW_LOG.md`
+  itself states the rule already implied everywhere else in this plan —
+  agent writes code, human reviews, tests/CI validate, approved changes
+  merge — and adds only one thing: do not fabricate an entry. Record a
+  finding there only when it actually happened. This file is a capstone
+  deliverable alongside this document and
+  `docs/CCVIE_Project_26_Workflow.md`.
 
 ## 10. CLAUDE.md — Agent Orientation File
 
@@ -701,6 +749,11 @@ Run these steps in order, from a fresh clone.
 7. `make dev-backend` — starts the FastAPI app with live reload.
 8. `make dev-frontend` — starts the Next.js dev server.
 9. Open `http://localhost:3000` in a browser.
+10. `./scripts/demo_rollback.sh` — runs the local rollback demonstration
+    (start v1, deploy a simulated broken v2, health check fails, roll
+    back to v1, health check passes). Docker only; no cloud, no
+    Kubernetes. This satisfies the capstone's non-production deployment,
+    health-check, and rollback requirements at local scale (Section 2).
 
 Windows note: the team works on Windows with PowerShell. Treat the
 `Makefile` as an optional convenience layer, not a requirement. Install GNU
@@ -755,6 +808,10 @@ checks in order, once the skeleton exists.
    Confirm the agent can state, from that file alone, where contracts
    live, where config lives, and which folder it may edit for a stated
    task.
+10. Run `./scripts/demo_rollback.sh`. Confirm it starts v1, confirms v1
+    healthy, deploys the simulated broken v2, detects the failed health
+    check, rolls back to v1, and confirms v1 healthy again — all on
+    local Docker, nothing else.
 
 If every check above passes, the repository structure is ready for full
 layer implementation to begin.
@@ -765,17 +822,16 @@ The full architecture in this plan is larger than the timeline. Build it
 in this order. Do not start a later phase before the core end-to-end demo
 in Phase 1 through Phase 4 works.
 
-1. **Phase 1 — Core path.** Data Foundation tables, the Poisson detection
-   pipeline, evidence retrieval, the FastAPI route, and the insight feed
-   UI. This alone must run end to end before any other phase starts.
-2. **Phase 2 — Investigation pipeline.** Graph queries, vector queries,
-   and the deterministic router (Section on router intents in
-   `docs/CCVIE_Project_26_Workflow.md`) for the Simple path; the
-   deterministic complexity detector, LLM Query Planner, Pydantic plan
-   validation, and `plan_executor.py` (Section 5's Query Planner Safety
-   Rule) for the Complex path. Do not let Query Planner work delay the
-   Phase 1 milestone; land the Simple path and the planner's safety
-   boundary before polishing complex-query coverage.
+1. **Phase 1 — Core path.** `Data -> Detection -> Retrieval -> Evidence ->
+   API -> UI`: Data Foundation tables, the Poisson/low-volume detection
+   policy, the Simple-path deterministic router with its graph, vector,
+   and SQL retrieval primitives, the FastAPI route, and the insight feed
+   UI. Goal: a working end-to-end local CCVIE demo. This alone must run
+   before any other phase starts.
+2. **Phase 2 — Query Planner.** `Deterministic Complexity Detector ->
+   Query Planner -> Plan Validation -> Controlled Plan Executor -> Complex
+   Investigation Evaluation` (Section 5's Query Planner Safety Rule). Do
+   not let this phase delay the Phase 1 end-to-end milestone.
 3. **Phase 3 — Generation and trust.** LLM synthesis and the citation
    validator from Section 5.
 4. **Phase 4 — Evaluation and CI.** The golden sets, `eval-gate.yml`, and
@@ -784,6 +840,19 @@ in Phase 1 through Phase 4 works.
    from `docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md`, the
    top-5-then-view-all evidence UX, and the feedback buttons. Cut this
    phase first if time runs out; it is additive, not load-bearing.
+
+**Final Engineering Evidence.** Before the final demo, confirm all of the
+following exist, in addition to the phases above — none of them is a new
+phase, they are checks that close out work already in flight:
+
+```
+Local health checks        (Section 11 dev-backend/dev-frontend + demo_rollback.sh)
+Rollback demonstration      (scripts/demo_rollback.sh, Section 11/13)
+Operating runbook           (docs/runbook.md)
+Agent review log            (docs/AGENT_REVIEW_LOG.md, Section 9)
+Security evidence           (Section 5 Query Planner Safety Rule, citation validation)
+Evaluation evidence         (Section 8 gate output, M-1 through M-4b)
+```
 
 ## 15. Project Maturity Statement
 
@@ -794,7 +863,14 @@ percentage.
 The honest framing: academically strong, architecturally
 production-minded, not yet production-proven. Production-proven requires
 evidence this two-week capstone does not produce: load testing,
-failure/recovery testing, security validation, observability, and a
-rollback demonstration. Evaluation results from Section 8 prove detection
-and routing quality; they do not by themselves prove production
+failure/recovery testing under real traffic, cloud security validation,
+and production observability. Evaluation results from Section 8 prove
+detection and routing quality; they do not by themselves prove production
 readiness.
+
+One item moved from "not produced" to "produced, at local scale":
+`scripts/demo_rollback.sh` (Section 11) is a real, reproducible local
+Docker rollback demonstration. Do not overstate it: it proves the
+start/deploy/health-check/rollback mechanism works on one machine, not
+that CCVIE has been rollback-tested under production traffic, load, or
+cloud infrastructure failure.
