@@ -74,6 +74,68 @@ Rule states why: the Complex path adds a validated LLM planning step in
 front of the same deterministic execution the Simple path already uses,
 never a replacement for it.
 
+### GraphRAG Terminology
+
+Describe the Layer 1 graph model with one wording, everywhere:
+
+> PostgreSQL-based relational property-graph model with GraphRAG-style
+> retrieval.
+
+Never describe it as a dedicated graph database. The implementation is:
+
+```
+graph_nodes
+graph_edges
+    ↓
+SQL-based graph traversal
+    ↓
+GraphRAG-style retrieval
+```
+
+`graph_nodes`/`graph_edges` are ordinary relational tables with JSONB
+properties, read with SQL joins. This is precise and defensible in a
+panel Q&A; do not add a dedicated graph database to make the retrieval
+sound more sophisticated than it is.
+
+A meaningful retrieval from this model is multi-hop, not one join. The
+canonical example, used in the investigation flow (Layer 2, GRAPH route)
+and in evaluation (graph recall, Section 8):
+
+```
+Issue -> Pack -> Region -> Related Issue
+```
+
+For example: start from one confirmed Issue node, traverse to its Pack,
+from Pack to Region, then from Region to any other Issue node sharing
+that Region — this is how the GRAPH route answers "is this issue
+happening elsewhere," not a single-table lookup.
+
+### Low-Volume Detection Policy
+
+The Detection pipeline's Poisson scan assumes a baseline count large
+enough for a spike to be statistically meaningful. It is not sufficient
+when the baseline is zero or very small; a jump from 0 to 3 complaints is
+not a Poisson spike, it is the entire population.
+
+```
+baseline >= MIN_POISSON_BASELINE_COUNT -> Poisson scan
+baseline <  MIN_POISSON_BASELINE_COUNT -> Low-volume detection policy
+```
+
+`MIN_POISSON_BASELINE_COUNT` (Section 6) is the one switch between the
+two policies. The low-volume policy uses deterministic minimum-count and
+historical-context rules, not a second statistical model, and marks its
+result explicitly as low-volume so the UI and evaluation can distinguish
+it from a Poisson-confirmed spike. Do not add statistical complexity here
+beyond what the evaluation requires. `data_foundation/detection.py`
+(Section 3) owns both the Poisson scan and the low-volume policy, so one
+file, not two divergent implementations, decides which path a given
+region/issue/week takes.
+
+Test both sides of the switch, not only the common case: `baseline = 0`,
+`baseline = 1`, a low but nonzero baseline, a normal baseline, and a
+high-volume spike (Section 7).
+
 ## 2. Repository Structure Decision
 
 **Decision: one monorepo. Not separate repositories.**
@@ -99,6 +161,14 @@ Reasons:
 
 Do not add Nx, Turborepo, Kubernetes, or a service mesh to this project.
 These tools solve problems this project does not have.
+
+**Scope decision: this capstone demonstrates locally.** Do not add cloud
+deployment, canary deployment, or rollback implementation to the current
+scope. Spend remaining engineering time on GraphRAG correctness,
+low-volume detection, evidence limits, the Query Planner, evaluation,
+security boundaries, and local demo reliability — not on infrastructure
+this two-week project does not need. Section 15 states the resulting
+maturity honestly.
 
 ## 3. Full Folder Tree
 
@@ -126,6 +196,7 @@ CCVIE/
 │   │       ├── data_foundation/      # Player 1 code
 │   │       │   ├── db.py             # asyncpg pool and connection helpers
 │   │       │   ├── ingestion.py      # hourly batch ingestion job, nightly low-coverage flagging job
+│   │       │   ├── detection.py      # Poisson scan + low-volume detection policy, see Section 1
 │   │       │   ├── embeddings.py     # sentence-transformers wrapper
 │   │       │   ├── bertopic_enrichment.py  # daily supplemental clustering job, see docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md
 │   │       │   └── queries/
@@ -331,6 +402,26 @@ all of: an incremented `plan_version`, updated Pydantic contracts, updated
 executor compatibility, an updated planner prompt/schema, updated planner
 golden tests, updated evaluation fixtures, and a new ADR.
 
+### Evidence and Citation Limit
+
+Do not word anything, in code, docs, or the demo script, as if the system
+requires exactly 45 verbatims. `MAX_EVIDENCE_ITEMS` (Section 6, default
+45) is a cap, not a target: `top_k <= MAX_EVIDENCE_ITEMS`.
+
+```
+18 matching complaints  -> return up to 18
+45 matching complaints  -> return 45
+250 matching complaints -> retrieve/rank the top 45
+```
+
+Citation validation (above) already checks every citation the generated
+response actually used against the retrieved evidence set; it does not,
+and must not, assume the set has exactly 45 members. The UI reflects the
+real count: `Showing 18 of 18`, or `Showing 45 of 250` with `[View all]`.
+`PLANNER_MAX_EVIDENCE_ITEMS` (Section 6) is the Complex path's version of
+this same cap; keep both settings equal by default so "45" means one
+thing across the Simple and Complex paths.
+
 ## 6. Configuration Rule
 
 **Rule: one settings object holds every configuration value. No file reads
@@ -366,14 +457,26 @@ ROUTER_WORD_COUNT_HIGH=150
 ROUTER_TAXONOMY_COVERAGE_HIGH=0.80
 ROUTER_TAXONOMY_COVERAGE_LOW=0.40
 
+# --- Evidence retrieval cap (Layer 3, both Simple and Complex paths).
+# This is a cap, not a required count: top_k <= MAX_EVIDENCE_ITEMS. See
+# the Evidence and Citation Limit note in Section 5. ---
+MAX_EVIDENCE_ITEMS=45
+
 # --- Query Planner (Layer 2/3, Complex investigation path only,
-# see the Query Planner Safety Rule in Section 5) ---
+# see the Query Planner Safety Rule in Section 5). PLANNER_MAX_EVIDENCE_ITEMS
+# is this same cap for the Complex path; keep it equal to
+# MAX_EVIDENCE_ITEMS above unless a documented reason requires otherwise. ---
 PLANNER_ENABLED=true
 PLANNER_MAX_OPERATIONS=8
 PLANNER_MAX_EXECUTION_DEPTH=5
 PLANNER_MAX_EXECUTION_TIME_SECONDS=15
 PLANNER_MAX_EVIDENCE_ITEMS=45
 PLANNER_SUPPORTED_PLAN_VERSION=1.0
+
+# --- Detection thresholds (Layer 1, see the Low-Volume Detection Policy
+# in Section 1). Below this baseline, detection.py uses the deterministic
+# low-volume policy instead of the Poisson scan. ---
+MIN_POISSON_BASELINE_COUNT=5
 
 # --- Ingestion cadence (see ADR-0003) ---
 INGESTION_CADENCE_MINUTES=60
@@ -428,13 +531,20 @@ model name from leaking into code where it becomes hard to change.
   count, and expected baseline lead time. `plant_issue.py` reads this file
   to seed the data. `evaluation/lead_time.py` reads the same file to check
   detection. One file removes drift between what the team planted and what
-  the team checks for.
+  the team checks for. Include planted cases on both sides of
+  `MIN_POISSON_BASELINE_COUNT`: baseline = 0, baseline = 1, a low nonzero
+  baseline, a normal baseline, and a high-volume spike, so `detection.py`'s
+  low-volume policy is tested, not only the Poisson scan (see Section 1,
+  Low-Volume Detection Policy).
 - `data/golden/router_labeled_queries.json` holds 120 query pairs and
   their correct path: 30 Graph, 30 SQL Aggregate, 30 Vector, 30 Hybrid.
   Include ambiguous and difficult queries (for example a comparison query
-  spanning two regions), not only obvious single-entity cases. Both the
-  router test harness and CI use this file. This is the one number for
-  the router golden set; do not restate a different count elsewhere.
+  spanning two regions), not only obvious single-entity cases. The Graph
+  set must include at least one genuine multi-hop case (`Issue -> Pack ->
+  Region -> Related Issue`, Section 1), not only single-join lookups, so
+  graph recall reflects real GraphRAG-style retrieval. Both the router
+  test harness and CI use this file. This is the one number for the
+  router golden set; do not restate a different count elsewhere.
 - `data/golden/eval_fixture.jsonl` is a small, fixed dataset. The CI gate
   uses this file, not the full generated dataset, so every CI run stays
   fast and repeats the same result.
