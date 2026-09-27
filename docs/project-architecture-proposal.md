@@ -74,6 +74,26 @@ Rule states why: the Complex path adds a validated LLM planning step in
 front of the same deterministic execution the Simple path already uses,
 never a replacement for it.
 
+**Complexity detection has absolute precedence over deterministic intent
+classification.** The complexity detector runs first, on every query,
+before any intent feature is evaluated:
+
+```
+User Query -> Deterministic Complexity Detector
+    ↓
+Is query COMPLEX?
+    ├── YES -> Query Planner
+    └── NO  -> Deterministic Intent Router
+```
+
+A query classified `COMPLEX` goes through the Query Planner and must
+never be directly routed using the Simple path's deterministic intent
+rules — even if it also contains strong Simple-intent keywords (for
+example a count word). `docs/CCVIE_Project_26_Workflow.md` Layer 2
+documents the Simple path's own deterministic precedence order for
+overlapping intents, and the required test cases for both kinds of
+ambiguity.
+
 ### GraphRAG Terminology
 
 Describe the Layer 1 graph model with one wording, everywhere:
@@ -109,6 +129,29 @@ For example: start from one confirmed Issue node, traverse to its Pack,
 from Pack to Region, then from Region to any other Issue node sharing
 that Region — this is how the GRAPH route answers "is this issue
 happening elsewhere," not a single-table lookup.
+
+**Indexing requirement.** GraphRAG-style multi-hop retrieval is
+implemented using PostgreSQL relational tables and joins. Indexing graph
+edge source and destination columns is therefore important to prevent
+unnecessary sequential scans as traversal depth increases:
+
+- `graph_edges(src)` must have a B-tree index.
+- `graph_edges(dst)` must have a B-tree index.
+- Check whichever `graph_nodes`/`graph_edges` JSONB properties are
+  actually filtered or joined on in practice, and index only those where
+  the query pattern justifies it. Do not index every JSONB property
+  indiscriminately; an unused index only costs write performance and
+  storage.
+- If `src`/`dst` are foreign keys, do not assume the foreign key
+  constraint itself provides the index a multi-hop query needs.
+  PostgreSQL does not automatically index the referencing column of a
+  foreign key. Verify the index exists explicitly (`\d graph_edges` in
+  psql, or a `pg_indexes` query); add it if it does not.
+
+`db/migrations/0001_init_entities.sql` (Section 3) is where
+`graph_nodes`/`graph_edges` and these indexes are created. Section 13's
+Verification Plan checks this explicitly, not only architecturally, so
+a missing index cannot silently ship.
 
 ### Low-Volume Detection Policy
 
@@ -257,7 +300,7 @@ CCVIE/
 │           └── insight-response.mock.json   # Day-1 mock, matches the locked contract
 ├── db/
 │   ├── migrations/                   # numbered plain SQL, applied in order
-│   │   ├── 0001_init_entities.sql
+│   │   ├── 0001_init_entities.sql    # entities + graph_nodes/graph_edges, with B-tree indexes on src/dst, see Section 1
 │   │   ├── 0002_pgvector_extension_and_index.sql
 │   │   ├── 0003_verbatims_and_embeddings.sql
 │   │   ├── 0004_low_coverage_queue_and_taxonomy_proposals.sql   # unique index prevents duplicate queue entries
@@ -582,7 +625,14 @@ model name from leaking into code where it becomes hard to change.
   Region -> Related Issue`, Section 1), not only single-join lookups, so
   graph recall reflects real GraphRAG-style retrieval. Both the router
   test harness and CI use this file. This is the one number for the
-  router golden set; do not restate a different count elsewhere.
+  router golden set; do not restate a different count elsewhere. Include
+  queries that match more than one intent signal, so the deterministic
+  precedence order (`docs/CCVIE_Project_26_Workflow.md` Layer 2) is
+  actually exercised, not just documented: `COUNT` + `SEMANTIC_SEARCH`,
+  `COUNT` + `COMPARISON`, `TREND` + `SEMANTIC_SEARCH`, `ENTITY_LOOKUP` +
+  `RELATIONSHIP`, and a Complex query that also contains a strong
+  Simple-intent keyword (for example "Count similar seal failures across
+  regions") to confirm complexity detection still takes precedence.
 - `data/golden/eval_fixture.jsonl` is a small, fixed dataset. The CI gate
   uses this file, not the full generated dataset, so every CI run stays
   fast and repeats the same result.
@@ -778,6 +828,7 @@ this as a documented fallback in `docs/runbook.md`, not the default path.
 | Database schema drifting from migrations | Regenerate and commit `db/schema.sql` after every migration change. Check it in CI. |
 | A model name hardcoded outside config | Run the CI grep check from Section 6 on every pull request. |
 | Merge conflicts on the shared contract file | Lock the first version on Day 1. Require both Player 2 and Player 4 to approve any later change. Keep each change small. |
+| Missing indexes on `graph_edges(src)`/`graph_edges(dst)` cause sequential scans that slow multi-hop GraphRAG retrieval as traversal depth grows | Create both B-tree indexes in `0001_init_entities.sql`. Do not assume a foreign key column is automatically indexed; verify explicitly (Section 13). |
 
 ## 13. Verification Plan
 
@@ -787,7 +838,11 @@ checks in order, once the skeleton exists.
 1. Run `make bootstrap` on a clean clone. Confirm it finishes with no
    error, for both the backend and the frontend.
 2. Run `docker compose up -d db`, then `make migrate`, then `make seed`.
-   Confirm the database contains the taxonomy rows.
+   Confirm the database contains the taxonomy rows. Confirm
+   `graph_edges(src)` and `graph_edges(dst)` each have a B-tree index
+   (`\d graph_edges` in psql, or a `pg_indexes` query) — do not assume a
+   foreign key column is indexed by default; verify it explicitly (see
+   the GraphRAG Terminology indexing requirement in Section 1).
 3. Run `make gen-data`. Confirm `data/generated/` fills with files and
    `data/golden/planted_issue_ground_truth.json` stays unchanged.
 4. Start the backend with `make dev-backend`. Open `/openapi.json` in a

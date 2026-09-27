@@ -68,7 +68,7 @@ Query Planner Safety Rule).
 
 **Tables:**
 - `taxonomy`: products, packs, regions, issue_types (from `seed.sql`)
-- `graph_nodes(id, label, props jsonb)` + `graph_edges(type, src, dst, props)` = a PostgreSQL-based relational property-graph model with GraphRAG-style retrieval: `graph_nodes`/`graph_edges` -> SQL-based graph traversal -> GraphRAG-style retrieval, with Issue nodes [blueprint requirement met without a dedicated graph database engine]. Canonical multi-hop example: `Issue -> Pack -> Region -> Related Issue` (see `project-architecture-proposal.md` Section 1)
+- `graph_nodes(id, label, props jsonb)` + `graph_edges(type, src, dst, props)` = a PostgreSQL-based relational property-graph model with GraphRAG-style retrieval: `graph_nodes`/`graph_edges` -> SQL-based graph traversal -> GraphRAG-style retrieval, with Issue nodes [blueprint requirement met without a dedicated graph database engine]. Canonical multi-hop example: `Issue -> Pack -> Region -> Related Issue` (see `project-architecture-proposal.md` Section 1). **Required indexes:** `graph_edges(src)` and `graph_edges(dst)` each need a B-tree index, created in `0001_init_entities.sql`, or multi-hop traversal degrades to sequential scans as depth grows - do not assume a foreign key column is indexed automatically, verify it explicitly. Do not index every JSONB property; index only the ones actually filtered or joined on.
 - `verbatims(id, text)` + `verbatim_embeddings(verbatim_id, embedding vector(384), model_name, embedding_version)` - dimension and model name come from `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIMENSION` in `config.py`, the one source of truth (`all-MiniLM-L6-v2` outputs 384, not 768); `model_name` + `embedding_version` make a future embedding-model migration explicit
 - `low_coverage_queue(verbatim_id, taxonomy_coverage, flagged_at, processed)` - verbatims below taxonomy coverage threshold, unique index on `verbatim_id WHERE processed = FALSE` prevents duplicate flags
 - `taxonomy_proposals(topic_id, keywords, status, notes, created_at)` - candidate topics from BERTopic, awaiting human review
@@ -94,6 +94,22 @@ Query Planner Safety Rule).
   another operation, multiple entities or dimensions. Default with no
   strong signal is `Simple`. Do not build a second LLM or BERT classifier
   to make this call.
+- **Complexity detection has absolute precedence over deterministic
+  intent classification.** No intent feature runs until the complexity
+  detector has answered Simple or Complex:
+
+  ```text
+  User Query -> Deterministic Complexity Detector
+      ↓
+  Is query COMPLEX?
+      ├── YES -> Query Planner
+      └── NO  -> Deterministic Intent Router
+  ```
+
+  A query classified `COMPLEX` goes to the Query Planner and is never
+  routed by the Simple path's intent rules below, even if it also
+  contains a strong Simple-intent keyword. See the ambiguous example
+  after the Simple path's precedence order.
 - **LangGraph flow:** `START -> load_context -> complexity_detector -> is_complex?`
   - `NO  -> deterministic_router -> execute_retrieval`
   - `YES -> query_planner -> validate_plan -> execute_plan -> collect_evidence`
@@ -110,6 +126,15 @@ Query Planner Safety Rule).
   - **TREND / SEMANTIC_SEARCH -> Route B2 Semantic:** "What's trending?" -> `ORDER BY embedding <=> query_embedding`
   - **COMPARISON / HYBRID -> Route C HYBRID:** "Compare PNW seal failures vs California last month" or "Is PNW issue related elsewhere?" -> Graph + Vector, each side scoped by the entities/time window the intent extracted
   - Router stays deterministic even for `COMPARISON`: it splits the query into per-entity sub-queries by rule, not by asking an LLM to interpret it
+- **Explicit precedence for overlapping intent matches (Simple path only; not a keyword-order accident — `rules.py` evaluates in this fixed order and stops at the first match):**
+  1. `RELATIONSHIP` - a resolved entity plus multi-hop language ("elsewhere", "related", "other regions")
+  2. `ENTITY_LOOKUP` - `entity_count >= ROUTER_ENTITY_COUNT_THRESHOLD`
+  3. `COMPARISON` - an explicit two-sided comparison ("vs", "compared to") between resolved entities
+  4. `COUNT` - `has_agg_word`
+  5. `TREND` - a temporal trend word ("trending", "over time") without an aggregate word
+  6. `SEMANTIC_SEARCH` - `has_semantic_word`, the fallback when nothing more specific matched
+  7. `HYBRID` - not a tier of its own; it is what fires when two intents from tiers 1-6 score equally and neither dominates (this is how `COMPARISON` already resolves in practice: comparing two entities needs both sides retrieved, so it always routes `HYBRID`)
+- **Ambiguous-query example:** "Count similar seal failures across regions" contains three signals at once - `COUNT` (an aggregate word), semantic similarity (`SEMANTIC_SEARCH`), and multiple regions/comparison (`COMPARISON`). This is exactly why complexity detection runs first: "similarity + comparison requests" and "cross-region requests" are complexity signals (above), so this query is classified `COMPLEX` and goes to the Query Planner - the Simple-path precedence order above is never consulted for it. If a future query trips the same keyword signals but the complexity detector still classifies it `Simple` (no strong complexity signal), the precedence order above applies deterministically instead of an LLM or ad-hoc keyword-scan order.
 - **Output:** `RouteDecision` contract
 
 **Complex path - Query Planner (`router/planner.py`, `router/plan_executor.py`)**
@@ -173,7 +198,7 @@ Query Planner Safety Rule).
 
 **Golden Sets:** `data/golden/`
 - `planted_issue_ground_truth.json` [20 planted issues]
-- `router_golden.jsonl` [120 queries, 2 annotators, kappa>0.65] - THIS WAS MISSING = M-4 CRITICAL
+- `router_golden.jsonl` [120 queries, 2 annotators, kappa>0.65] - THIS WAS MISSING = M-4 CRITICAL. Must include queries matching more than one intent signal, to exercise the deterministic precedence order (Layer 2), not just the obvious single-intent cases: `COUNT` + `SEMANTIC_SEARCH`, `COUNT` + `COMPARISON`, `TREND` + `SEMANTIC_SEARCH`, `ENTITY_LOOKUP` + `RELATIONSHIP`, and a `COMPLEX`-classified query that also contains a strong Simple-intent keyword (for example "Count similar seal failures across regions") to confirm complexity detection still wins.
 - `eval_fixture.jsonl` [30 queries for citation]
 - complex investigation golden set (new, additional to router_golden.jsonl, feeds M-4b): multi-region investigation, similar-complaint investigation, historical comparison, trend + comparison, ambiguous queries, unsupported queries, missing-context queries, multi-step evidence requests
 
