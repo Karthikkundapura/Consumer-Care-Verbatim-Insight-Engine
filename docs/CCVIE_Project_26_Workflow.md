@@ -244,10 +244,10 @@ Query Planner Safety Rule).
 **Pytest + GitHub Actions**
 
 **Golden Sets:** `data/golden/`
-- `planted_issue_ground_truth.json` [20 planted issues, each with a planted **onset date**, not a hardcoded expected lead time - lead time is always measured as `detection_date - onset_date` against two baselines, see Layer 1]
-- `router_golden.jsonl` [120 queries, 2 annotators, kappa>0.65] - THIS WAS MISSING = M-4 CRITICAL. Must include queries matching more than one intent signal, to exercise the deterministic precedence order (Layer 2), not just the obvious single-intent cases: `COUNT` + `SEMANTIC_SEARCH`, `COUNT` + `COMPARISON`, `TREND` + `SEMANTIC_SEARCH`, `ENTITY_LOOKUP` + `RELATIONSHIP`, and a `COMPLEX`-classified query that also contains a strong Simple-intent keyword (for example "Count similar seal failures across regions") to confirm complexity detection still wins.
-- `eval_fixture.jsonl` [30 queries for citation]
-- complex investigation golden set (new, additional to router_golden.jsonl, feeds M-4b): multi-region investigation, similar-complaint investigation, historical comparison, trend + comparison, ambiguous queries, unsupported queries, missing-context queries, multi-step evidence requests
+- Planted-issue ground truth — see `project-architecture-proposal.md` Section 7 for the canonical count and contents (each issue carries a planted **onset date**, not a hardcoded expected lead time — lead time is always measured as `detection_date - onset_date` against two baselines, see Layer 1; do not restate the count here).
+- Router golden set — see `project-architecture-proposal.md` Section 7 for the canonical filename, count, class breakdown, and labeling method (M-4 CRITICAL; do not restate the spec here).
+- CI eval fixture — see `project-architecture-proposal.md` Section 7 for the canonical size and purpose (the file the CI gate loads).
+- complex investigation golden set (new, additional to the router golden set in proposal Section 7, feeds M-4b): multi-region investigation, similar-complaint investigation, historical comparison, trend + comparison, ambiguous queries, unsupported queries, missing-context queries, multi-step evidence requests
 - **coverage set:** one representative case per Question Coverage Catalogue class (`project-architecture-proposal.md` Section 17 operational table: class → example → route/planner op → coverage case → metric, 15 queries per class). One router handles all via precedence — do not build 15 systems.
 - **citation set:** expected supporting `SourceRef` IDs plus labelled claim/verbatim pairs, for M-3 and the claim-support check
 - **numeric set:** count/trend/comparison/profile questions with a known-correct number, for numeric verification

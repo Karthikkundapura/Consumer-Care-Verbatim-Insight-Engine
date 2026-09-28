@@ -982,7 +982,9 @@ model name from leaking into code where it becomes hard to change.
   `db/seed/seed_taxonomy.sql` must use this same vocabulary, so the
   generator never invents an entity the database does not know.
 - `data/golden/planted_issue_ground_truth.json` is the machine-readable
-  form of ADR-0002. It states the exact region, week range, complaint
+  form of ADR-0002. It holds 20 planted issues. This is the one number
+  for the planted-issue count; do not restate a different count
+  elsewhere. It states the exact region, week range, complaint
   count, and the planted **onset date** — the date the synthetic spike
   actually starts. It does not state an expected lead-time number.
   `plant_issue.py` reads this file to seed the data.
@@ -1006,7 +1008,7 @@ model name from leaking into code where it becomes hard to change.
   not just from checking more often.
 - `data/golden/router_labeled_queries.json` holds 120 query pairs and
   their correct path: 30 Graph, 30 SQL Aggregate, 30 Vector, 30 Hybrid.
-  Include ambiguous and difficult queries (for example a comparison query
+  Label with 2 annotators and keep kappa above 0.65. Include ambiguous and difficult queries (for example a comparison query
   spanning two regions), not only obvious single-entity cases. The Graph
   set must include at least one genuine multi-hop case (`Issue -> Pack ->
   Region -> Related Issue`, Section 1), not only single-join lookups, so
@@ -1020,9 +1022,11 @@ model name from leaking into code where it becomes hard to change.
   `RELATIONSHIP`, and a Complex query that also contains a strong
   Simple-intent keyword (for example "Count similar seal failures across
   regions") to confirm complexity detection still takes precedence.
-- `data/golden/eval_fixture.jsonl` is a small, fixed dataset. The CI gate
+- `data/golden/eval_fixture.jsonl` holds 30 queries for citation. It is
+  a small, fixed dataset. The CI gate
   uses this file, not the full generated dataset, so every CI run stays
-  fast and repeats the same result.
+  fast and repeats the same result. This is the one number for the eval
+  fixture size; do not restate a different count elsewhere.
 - `data/generated/` is gitignored. It holds the bulk output of
   `make gen-data`. Never commit this folder. Regenerate it at any time
   with a fixed random seed, so results stay repeatable.
