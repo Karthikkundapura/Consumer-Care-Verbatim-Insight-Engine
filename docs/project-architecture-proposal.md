@@ -178,10 +178,10 @@ unnecessary sequential scans as traversal depth increases:
 - `graph_edges(src)` must have a B-tree index.
 - `graph_edges(dst)` must have a B-tree index.
 - Check whichever `graph_nodes`/`graph_edges` JSONB properties are
-  actually filtered or joined on in practice, and index only those where
-  the query pattern justifies it. Do not index every JSONB property
-  indiscriminately; an unused index only costs write performance and
-  storage.
+  actually filtered or joined on in practice, and add a GIN index on
+  `props` for those, not a B-tree. Index only where the query pattern
+  justifies it; do not index every JSONB property indiscriminately —
+  an unused index only costs write performance and storage.
 - If `src`/`dst` are foreign keys, do not assume the foreign key
   constraint itself provides the index a multi-hop query needs.
   PostgreSQL does not automatically index the referencing column of a
@@ -234,6 +234,35 @@ better, and do not claim "GraphRAG is storage-independent" as an absolute
 statement. Frame the choice as an architectural trade-off and a scope
 decision for this project, every time this comes up — in this document,
 in the workflow doc, and in the demo script.
+
+**Local, not Global, GraphRAG.** This answers "are we actually using
+local graph retrieval?" precisely, in one line:
+
+> Local GraphRAG: entity-resolved retrieval plus a 2-3 hop subgraph
+> (`Pack -> Component -> Supplier -> Other Products`) via a recursive CTE
+> over `graph_edges(src, dst, type)`, with a GIN index on `props`, fused
+> with pgvector HNSW and FTS via Reciprocal Rank Fusion (Section 5,
+> Hybrid Retrieval Design).
+
+That single line is the whole answer: retrieval starts from one or more
+entities Entity Resolution (above) already resolved, expands 2-3 hops
+through `graph_edges` (the two multi-hop examples above are both this
+depth), and the resulting subgraph context is fused with vector and FTS
+evidence through RRF — the same hybrid pipeline every other route uses.
+This is why `graph_edges(src)`/`graph_edges(dst)` get B-tree indexes and
+`graph_edges`'/`graph_nodes`' JSONB `props` gets a GIN index wherever a
+property is actually filtered on (the Indexing requirement above, made
+concrete): a GIN index is what makes filtering that JSONB column fast,
+the same way the B-tree indexes make the `src`/`dst` joins fast.
+
+**Global GraphRAG — Leiden community detection plus community
+summaries — is explicitly deferred to the COULD/FUTURE tier (Section
+18), not needed here.** Global GraphRAG answers corpus-wide thematic
+questions ("what are the major themes across all complaints"); CCVIE's
+Investigation pipeline answers entity-centric questions about one
+issue/pack/region at a time, which Local GraphRAG already covers.
+Building Leiden clustering and summarization would be solving a problem
+this capstone's question shapes (Section 17) do not have.
 
 ### Detection Pipeline Design
 
@@ -1468,6 +1497,9 @@ optional so nobody re-proposes them as if they were forgotten:**
 ```
 MCP wrapper
 Neo4j adapter (or any dedicated graph database)
+Global GraphRAG (Leiden community detection + community summaries) -
+  entity-centric Local GraphRAG (Section 1) already covers this
+  capstone's question shapes (Section 17)
 Cloud deployment
 Semantic count estimation for unmapped concepts
 Multi-million-record scale testing
