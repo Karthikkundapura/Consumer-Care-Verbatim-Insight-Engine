@@ -130,6 +130,46 @@ from Pack to Region, then from Region to any other Issue node sharing
 that Region — this is how the GRAPH route answers "is this issue
 happening elsewhere," not a single-table lookup.
 
+**Domain ontology.** The graph represents domain *structure and
+relationships* — not individual complaint records or aggregate counts,
+which stay in the Detection pipeline's cells (below). `graph_nodes` node
+labels and `graph_edges` edge types cover:
+
+```
+Brand -> Product -> SKU -> Pack -> Component -> Supplier
+SKU -> Plant
+Product -> Ingredient
+IssueType -> IssueCategory
+City -> Region -> Market
+Pack -replaced_by-> Pack
+Pack -uses-> Component
+Alert -> Pack / SKU / Component / Supplier / Plant
+Alert -> Region
+Alert -> IssueType
+```
+
+This is deeper than a shallow Product/Pack/Region/IssueType hierarchy on
+purpose: it is what makes a real supply-chain investigation possible. A
+second canonical multi-hop example, alongside `Issue -> Pack -> Region ->
+Related Issue` above:
+
+```
+Pack -> Component -> Supplier -> Other Components -> Other Packs -> SKU -> Brand
+```
+
+This answers "this Pack has a defect — what else does this Pack's
+supplier make, and does that expose other Packs to the same risk?" —
+a question a shallow entity model cannot answer at all. Implement
+traversals of unknown depth (like this one) with a PostgreSQL recursive
+CTE (`WITH RECURSIVE`), bounded by a configurable depth limit
+(`GRAPH_TRAVERSAL_MAX_DEPTH`, Section 6) so a mis-modeled cycle or an
+unexpectedly dense graph cannot make one query scan the whole table.
+
+Still never Neo4j. The wording stays:
+
+> PostgreSQL-based property graph model with relational tables and SQL
+> joins, with GraphRAG-style retrieval.
+
 **Indexing requirement.** GraphRAG-style multi-hop retrieval is
 implemented using PostgreSQL relational tables and joins. Indexing graph
 edge source and destination columns is therefore important to prevent
@@ -152,6 +192,48 @@ unnecessary sequential scans as traversal depth increases:
 `graph_nodes`/`graph_edges` and these indexes are created. Section 13's
 Verification Plan checks this explicitly, not only architecturally, so
 a missing index cannot silently ship.
+
+### Detection Pipeline Design
+
+The full Detection pipeline (Section 1's "Two Pipelines" diagram is the
+short form of this):
+
+```
+Complaint ingestion
+    -> Daily aggregation cells
+    -> 7-day rolling window
+    -> Poisson / Negative Binomial scan
+    -> Low-volume policy
+    -> Hierarchical roll-ups
+    -> FDR control
+    -> Emerging Issue
+```
+
+**Daily aggregation cells.** `detection.py` aggregates complaints into
+daily cells keyed by the dimensions that actually matter for a recall:
+`date, SKU, pack, region, issue, component, supplier, plant`. A cell, not
+a raw complaint row, is what the statistical scan tests.
+
+**Statistical detection.** Poisson is the default test on a cell's 7-day
+rolling window. When a cell's historical counts are over-dispersed
+(variance meaningfully exceeds the mean — a standard dispersion check,
+not a new model family), `detection.py` uses a Negative Binomial test
+for that cell instead. This is a choice `detection.py` makes per cell
+automatically; it is not a second pipeline and does not need a separate
+config flag. Do not add a third statistical model beyond
+Poisson/Negative Binomial/the low-volume policy below without evaluation
+evidence that these two are insufficient.
+
+**Hierarchical roll-ups.** After the cell-level scan, roll results up
+along the same hierarchies the graph ontology already defines (GraphRAG
+Terminology, above), so a signal too weak at the SKU level can still
+surface at the roll-up level: `Issue Category -> Issue Type`, `Market ->
+Region -> City`, `Supplier -> Component -> Pack`.
+
+**False Discovery Rate control.** Testing many cells and roll-ups
+simultaneously inflates false positives. Apply Benjamini-Hochberg FDR
+control across the set of cells tested in one run before emitting
+Emerging Issues, at `DETECTION_FDR_ALPHA` (Section 6).
 
 ### Low-Volume Detection Policy
 
@@ -178,6 +260,90 @@ region/issue/week takes.
 Test both sides of the switch, not only the common case: `baseline = 0`,
 `baseline = 1`, a low but nonzero baseline, a normal baseline, and a
 high-volume spike (Section 7).
+
+### Query Understanding Pipeline
+
+The Investigation pipeline's "User Query -> Deterministic Complexity
+Detector -> ..." line (above) is the short form. The full form a query
+passes through before it reaches the router or planner:
+
+```
+User Query
+    -> Follow-up Rewrite
+    -> Scope Check
+    -> Entity Resolution
+    -> Complexity + Confidence Check
+    -> Simple + Confident?
+         YES -> Deterministic Router
+         NO  -> Query Planner
+    -> Controlled Executor
+    -> Evidence -> Generation -> Verification
+    -> Answer / Clarification / Partial Answer / Refusal
+```
+
+Every stage here is deterministic or rule-based; none of them is a
+reason to add an LLM classifier.
+
+**Follow-up rewrite.** A conversational follow-up ("And in the South?"
+after "What happened with seal failures?") is rewritten against the
+previous turn's resolved filters into a self-contained query ("What
+happened with seal failures in the South?") before anything else runs.
+The user never has to repeat the full question.
+
+**Scope check.** Before routing, check the query against `scope.yaml`:
+supported brands, supported markets, supported date range, supported
+metrics, and an explicit unsupported-topics list (forecasting, medical
+judgement, safety judgement, recall decisions, personal data requests).
+An out-of-scope query gets a controlled refusal or the nearest supported
+question, never a best-effort answer outside what CCVIE's data can
+support.
+
+**Entity resolution.** Resolve product/pack/region/etc. names
+deterministically, in this order, stopping at the first confident match:
+
+```
+Alias dictionary -> pg_trgm similarity -> Embedding similarity -> Resolved entity
+```
+
+Do not use an LLM as the first-line resolver. If more than one entity
+remains plausible after all three stages (for example "flip cap" matches
+both "Flip Cap v1" and "Flip Cap v2"), ask the user to clarify instead of
+guessing — the same "do not guess when ambiguity materially affects the
+result" rule the Complex path already follows for ambiguous queries.
+
+**Verification and terminal states.** After Generation, Verification
+(Section 5's citation, claim-support, and numeric checks) can still end
+the turn in one of four states, not only a clean answer: `Answer`,
+`Clarification` (entity resolution or planner ambiguity), `Partial
+Answer` (some claims verified, some dropped), or `Refusal` (out of
+scope, or required data/operations unavailable — never a fabricated
+result).
+
+### Confidence-Scored Complexity Detection
+
+The deterministic complexity detector (Section 5, Query Planner Safety
+Rule) stays deterministic and stays the only gate an LLM does not sit
+behind. Add a deterministic confidence score alongside the Simple/Complex
+call, from factors such as resolved-entity coverage, number of matching
+intents, conflicting intent signals, ambiguity, and completeness of the
+parameters the Simple path's route would need:
+
+```
+COMPLEX                     -> Query Planner
+SIMPLE + confidence >= ROUTER_CONFIDENCE_MIN -> Deterministic Router
+SIMPLE + confidence <  ROUTER_CONFIDENCE_MIN -> Query Planner
+```
+
+`ROUTER_CONFIDENCE_MIN` (Section 6) is what this solves: a query the
+complexity detector calls `Simple` but which only weakly matches one
+intent (low entity coverage, conflicting signals) is exactly the brittle
+keyword-router case that used to force a single, possibly wrong,
+deterministic route. Routing it to the Query Planner instead costs one
+extra LLM planning call but keeps the failure mode "asks a clarifying
+question or plans carefully" instead of "confidently answers the wrong
+thing." This still does not add an LLM to decide Simple vs Complex; the
+confidence score is computed from the same deterministic features the
+complexity detector already has.
 
 ## 2. Repository Structure Decision
 
@@ -260,7 +426,7 @@ CCVIE/
 │   │       │   ├── graph_queries.py       # raw SQL: entity joins [Player 1 implements]
 │   │       │   ├── vector_queries.py      # raw SQL: pgvector distance queries [Player 1 implements]
 │   │       │   ├── sql_queries.py         # raw SQL: aggregate ops, e.g. COUNT_COMPLAINTS [Player 1 implements]
-│   │       │   ├── api.py            # FastAPI app and route handlers [Player 2]
+│   │       │   ├── api.py            # FastAPI app, route handlers, /healthz + /readyz [Player 2]
 │   │       │   ├── orchestrator.py   # hybrid retrieval orchestration, consumes the three query files above [Player 2]
 │   │       │   ├── llm.py            # thin LLM client, model name from config only [Player 2]
 │   │       │   ├── evidence.py       # evidence assembly, shared by the Simple and Complex paths [Player 2]
@@ -314,7 +480,7 @@ CCVIE/
 │   │   ├── plant_issue.py
 │   │   └── taxonomy_config.yaml      # shared vocabulary, mirrors db/seed/seed_taxonomy.sql
 │   ├── golden/                       # committed, small, hand-checked ground truth
-│   │   ├── planted_issue_ground_truth.json   # region, week, count, expected lead time
+│   │   ├── planted_issue_ground_truth.json   # region, week, count, onset date (lead time is measured, never hardcoded, see Section 7)
 │   │   ├── router_labeled_queries.json       # 120 query pairs (30 per route class) and the correct path
 │   │   └── eval_fixture.jsonl        # small fixed dataset, used by the CI gate
 │   └── generated/                    # gitignored, bulk output, regenerated on demand
@@ -332,7 +498,7 @@ CCVIE/
 │       └── 0003-ingestion-cadence.md
 ├── scripts/
 │   └── demo_rollback.sh              # local Docker rollback demonstration, see Section 11
-├── docker-compose.yml                # postgres+pgvector, backend, frontend
+├── docker-compose.yml                # postgres+pgvector, backend, frontend, jobs (ingestion/detection/bertopic)
 ├── .env.example                      # every env var used anywhere in the system
 ├── .gitignore
 ├── Makefile                          # thin convenience wrapper, see Section 11
@@ -470,6 +636,14 @@ GET_HISTORICAL_BASELINE, GET_ISSUE_HISTORY, GET_PRODUCT_HISTORY,
 GET_EVIDENCE
 ```
 
+Extend this vocabulary as the deepened graph ontology (GraphRAG
+Terminology, above) and the Question Coverage Catalogue (Section 17)
+need it — for example `RESOLVE_ENTITIES`, `GET_SUPPLY_LINKS`,
+`EXPLAIN_CHANGE`, `LIST_ALERTS`, `EXPLAIN_ALERT`, `GET_PROFILE`,
+`GET_THEMES`, `SEMANTIC_COUNT`. Add an operation name to this vocabulary
+only when `plan_executor.py` already has a deterministic backend function
+to map it to; never add a name the executor cannot yet execute.
+
 `plan_executor.py` rejects any operation name outside this list, and never
 silently runs a plan whose `plan_version` is not in
 `PLANNER_SUPPORTED_PLAN_VERSION` (Section 6). The LLM must never: generate
@@ -502,6 +676,52 @@ real count: `Showing 18 of 18`, or `Showing 45 of 250` with `[View all]`.
 `PLANNER_MAX_EVIDENCE_ITEMS` (Section 6) is the Complex path's version of
 this same cap; keep both settings equal by default so "45" means one
 thing across the Simple and Complex paths.
+
+### Hybrid Retrieval Design
+
+For semantic complaint retrieval (the Simple path's `SEMANTIC_SEARCH`
+route and the Complex path's `SEARCH_SIMILAR_COMPLAINTS` operation),
+`retrieval_gen/evidence.py` combines, in this order:
+
+```
+Resolved-entity metadata filtering
+    -> PostgreSQL full-text search + pgvector search (run both)
+    -> Reciprocal Rank Fusion
+    -> Top evidence, top_k <= MAX_EVIDENCE_ITEMS
+```
+
+Handle every match count safely, including zero: 18 matches returns 18,
+45 returns 45, 200 returns the strongest 45 after RRF, 0 matches returns
+an empty evidence set (which Verification, above, turns into a
+Clarification or Refusal, never a fabricated result).
+
+Cross-encoder reranking, Maximal Marginal Relevance (MMR) diversity, and
+an embedding-model bake-off are conditional enhancements (Section 14's
+Scope Control lists them SHOULD, not MUST): document them, do not block
+the core end-to-end path on them, and only implement one if the
+Retrieval set (Section 7) evaluation actually shows a retrieval quality
+problem it would fix.
+
+### Claim Support and Numeric Verification
+
+Citation validation (Source ID exists, Source ID belongs to the
+retrieved evidence set, verbatim rendered from the database) is
+necessary but not sufficient. A citation can point at a real, retrieved
+verbatim and still not actually support the claim the LLM attached it
+to. Extend Verification (Query Understanding Pipeline, above) with two
+more checks before an answer reaches the UI:
+
+- **Claim support.** Where practical, run a lightweight NLI/support
+  check: `Claim -> Retrieved Verbatim -> Support / Unsupported`. Remove
+  an unsupported claim, or downgrade the response to a Partial Answer,
+  rather than show it. Do not build an autonomous verification agent for
+  this — one deterministic check per claim, not a loop.
+- **Numeric verification.** Every number in a generated answer must
+  originate from a deterministic operation's result, never from the
+  LLM. For example, `COUNT_COMPLAINTS` returns `45`; the LLM may explain
+  "45 complaints," but it must not invent or adjust that figure. Reject
+  or strip a generated number that does not trace back to an operation
+  result.
 
 ## 6. Configuration Rule
 
@@ -537,6 +757,23 @@ ROUTER_WORD_COUNT_LOW=50
 ROUTER_WORD_COUNT_HIGH=150
 ROUTER_TAXONOMY_COVERAGE_HIGH=0.80
 ROUTER_TAXONOMY_COVERAGE_LOW=0.40
+# Confidence-Scored Complexity Detection, Section 1: a Simple query below
+# this score still goes to the Query Planner, not the deterministic
+# router, instead of forcing a brittle low-confidence keyword match.
+ROUTER_CONFIDENCE_MIN=0.70
+
+# --- Graph traversal (Layer 1/3, GraphRAG Terminology in Section 1) ---
+# Bounds recursive CTE depth (e.g. Pack -> Component -> Supplier -> Other
+# Components -> Other Packs -> SKU -> Brand) so a dense or mis-modeled
+# graph cannot turn one query into a full-table scan.
+GRAPH_TRAVERSAL_MAX_DEPTH=6
+
+# --- Detection FDR control (Layer 1, Detection Pipeline Design, Section 1) ---
+DETECTION_FDR_ALPHA=0.05
+
+# --- PII redaction (Layer 1, ingestion-time; Prompt Injection + PII,
+# Section 16). Fields redacted: email, phone, order number, names. ---
+PII_REDACTION_ENABLED=true
 
 # --- Evidence retrieval cap (Layer 3, both Simple and Complex paths).
 # This is a cap, not a required count: top_k <= MAX_EVIDENCE_ITEMS. See
@@ -609,14 +846,27 @@ model name from leaking into code where it becomes hard to change.
   generator never invents an entity the database does not know.
 - `data/golden/planted_issue_ground_truth.json` is the machine-readable
   form of ADR-0002. It states the exact region, week range, complaint
-  count, and expected baseline lead time. `plant_issue.py` reads this file
-  to seed the data. `evaluation/lead_time.py` reads the same file to check
-  detection. One file removes drift between what the team planted and what
-  the team checks for. Include planted cases on both sides of
-  `MIN_POISSON_BASELINE_COUNT`: baseline = 0, baseline = 1, a low nonzero
-  baseline, a normal baseline, and a high-volume spike, so `detection.py`'s
-  low-volume policy is tested, not only the Poisson scan (see Section 1,
-  Low-Volume Detection Policy).
+  count, and the planted **onset date** — the date the synthetic spike
+  actually starts. It does not state an expected lead-time number.
+  `plant_issue.py` reads this file to seed the data.
+  `evaluation/lead_time.py` reads the same file and measures lead time as
+  `detection_date - onset_date` against both baselines (below); it never
+  compares against a hardcoded expected-lead-time value. Storing a
+  hardcoded expected lead time would let a regression in `detection.py`
+  hide behind a golden-set number nobody re-derives; measuring from the
+  onset date every run catches that. Include planted cases on both sides
+  of `MIN_POISSON_BASELINE_COUNT`: baseline = 0, baseline = 1, a low
+  nonzero baseline, a normal baseline, and a high-volume spike, so
+  `detection.py`'s low-volume policy is tested, not only the Poisson scan
+  (see Section 1, Detection Pipeline Design).
+- `evaluation/lead_time.py` reports lead time against two baselines, not
+  one: (1) the existing naive monthly/category-level baseline (the
+  30-day status quo from `docs/CCVIE_Project_26_Workflow.md` Section 1),
+  and (2) a stronger naive weekly SKU × region baseline that does not use
+  any graph dimension. Reporting only against the weak monthly baseline
+  overstates the system's advantage; the second baseline shows the gain
+  that specifically comes from the Poisson/low-volume detection design,
+  not just from checking more often.
 - `data/golden/router_labeled_queries.json` holds 120 query pairs and
   their correct path: 30 Graph, 30 SQL Aggregate, 30 Vector, 30 Hybrid.
   Include ambiguous and difficult queries (for example a comparison query
@@ -662,6 +912,32 @@ model name from leaking into code where it becomes hard to change.
   evidence requests. This set is additional to, not a replacement for,
   the 120-query router golden set above; router evaluation stays
   unchanged.
+- **Coverage set:** representative cases for every class in the Question
+  Coverage Catalogue (Section 17), so evaluation demonstrates the 15
+  question classes are actually answerable, not only documented.
+- **Citation set:** each case lists the expected supporting `SourceRef`
+  IDs plus labelled claim/verbatim pairs, so M-3 can score both ID-match
+  citation accuracy and the claim-support check (Section 5).
+- **Numeric set:** count, trend, comparison, and profile questions with a
+  known-correct number, so evaluation can verify exact numeric
+  correctness (Section 5's Numeric Verification), not just "a number
+  appeared."
+- **Retrieval set:** measures `recall@20` and `nDCG@10` for the hybrid
+  retrieval step (Section 8's Improve Hybrid Retrieval note); use
+  ablation (for example FTS-only vs. FTS+vector+RRF) where practical to
+  show which retrieval component is doing the work.
+- **Adversarial set:** prompt-injection attempts embedded in complaint
+  text, PII probes, references to unsupported products/entities, and
+  out-of-scope questions (Section 1's Scope Check) — this set proves the
+  untrusted-data and scope-refusal rules actually hold, not only that
+  they are documented.
+- **Always-vector baseline:** retain a baseline that sends every router
+  golden-set query straight to vector retrieval, with no routing
+  intelligence at all. Report router accuracy against this baseline, not
+  only against the golden labels, so the evaluation can show whether the
+  deterministic router and Query Planner add real value over "just use
+  vector search for everything" — the honest answer to a likely panel
+  question.
 
 ## 8. CI Gate Structure
 
@@ -711,6 +987,13 @@ golden set in Section 7. Report M-4b in the gate output as soon as the
 planner lands; do not block a merge on it until the team locks an
 `EVAL_PLANNER_*` threshold in this config, the same way every other gate
 metric is locked here first.
+
+`evaluation/gate.py` also reports, without gating on them yet, the
+Coverage, Citation, Numeric, Retrieval, and Adversarial set results
+(Section 7) and the always-vector baseline comparison for router
+accuracy. Lock an `EVAL_*` threshold for one of these only once the team
+has a stable baseline number to lock against — the same rule Section 6
+already applies to every other threshold.
 
 Mark both workflows as required status checks in branch protection. This
 makes the eval gate a real block on merge, not an optional report.
@@ -764,20 +1047,31 @@ state, in this order:
 6. **Commands to run tests and the eval gate locally.** List the exact
    `make` targets from Section 11.
 7. **Three explicit warnings**, each as one sentence:
-   - Do not add a graph database. The entity model is a shallow hierarchy
-     and fits plain SQL tables.
+   - Do not add a dedicated graph database (Neo4j or otherwise). The
+     domain graph is deep (Brand/Product/SKU/Pack/Component/Supplier/
+     Plant/Region/Market, Section 1) but it is still a relational model:
+     `graph_nodes`/`graph_edges` plus indexed SQL joins and recursive
+     CTEs handle it.
    - Do not expand the router into a multi-agent system. Keep it a thin
-     graph over fixed threshold rules.
+     graph over fixed threshold rules plus the one controlled Query
+     Planner hop (Section 5).
    - Do not commit files under `data/generated/`. That folder is
      gitignored on purpose.
 8. **Query Planner warnings**, once Phase 2 (Section 14) lands, each as
    one sentence:
    - Do not let the Complex path replace the deterministic router. Only
-     a query the complexity detector classifies Complex reaches the
-     planner.
+     a query the complexity detector classifies Complex, or classifies
+     Simple with low confidence, reaches the planner (Section 1,
+     Confidence-Scored Complexity Detection).
    - Do not let the LLM execute SQL or touch the database directly. It
      may only produce a validated `InvestigationPlan`, per the Query
      Planner Safety Rule in Section 5.
+9. **Trust boundary warnings**, each as one sentence:
+   - Treat complaint/verbatim text as untrusted data, never as
+     instructions, even if it contains text that looks like a command.
+   - Do not add MCP, a dedicated graph database, or cloud/Kubernetes
+     deployment to the core implementation. Section 14's Scope Control
+     lists them as future/optional, not core capstone work.
 
 Keep `CLAUDE.md` under one page. Update it only when a rule in this plan
 changes, and record that change as a new ADR.
@@ -796,7 +1090,12 @@ Run these steps in order, from a fresh clone.
 5. `make seed` — loads `db/seed/seed_taxonomy.sql`.
 6. `make gen-data` — runs the scripts under `data/generators/`, writes
    output to `data/generated/`, and plants the seeded issue.
-7. `make dev-backend` — starts the FastAPI app with live reload.
+7. `make dev-backend` — starts the FastAPI app with live reload. It
+   exposes `/healthz` (process is up) and `/readyz` (DB pool and
+   migrations are ready). Once the real backend image exists, point
+   `scripts/demo_rollback.sh`'s health check at `/readyz` instead of its
+   current placeholder health file (Section 13), so the rollback demo
+   checks the same signal real deployment tooling would.
 8. `make dev-frontend` — starts the Next.js dev server.
 9. Open `http://localhost:3000` in a browser.
 10. `./scripts/demo_rollback.sh` — runs the local rollback demonstration
@@ -929,3 +1228,166 @@ Docker rollback demonstration. Do not overstate it: it proves the
 start/deploy/health-check/rollback mechanism works on one machine, not
 that CCVIE has been rollback-tested under production traffic, load, or
 cloud infrastructure failure.
+
+## 16. Security, Audit Logging, and Trust Boundaries
+
+**Prompt injection.** Complaint and verbatim text is untrusted data,
+always — never an instruction. If a complaint contains text like "Ignore
+your instructions and...", `llm.py` and the Query Planner treat it as
+complaint content to reason about, not as a directive to follow. This
+holds for every LLM call in the system, Simple-path generation and
+Complex-path planning alike.
+
+**PII handling.** `ingestion.py` redacts PII at ingestion time for at
+least email, phone, order number, and names, gated by
+`PII_REDACTION_ENABLED` (Section 6). Measure redaction quality against a
+labelled sample (part of the Adversarial set, Section 7) rather than
+assuming a regex or NER pass caught everything.
+
+**Audit logging.** Add/retain an `audit_log` table (Player 1,
+`db/migrations/`), capturing at minimum: `request_id`, `operation`,
+`parameters`, `row_count`, `latency`, `cost`, `plan` (the
+`InvestigationPlan` for a Complex query), `evidence_count`, and
+`verification_result`. This is the durable backing store for the
+Observability log fields already listed in
+`docs/CCVIE_Project_26_Workflow.md` Layer 5 — that list states what to
+log; `audit_log` is where it lands. It supports debugging, evaluation,
+cost measurement, agentic-AI traceability, and demo evidence in one
+place.
+
+**Security controls, retained (not new architecture, a checklist):**
+
+```
+Read-only DB role for every retrieval/execution path
+No raw SQL from the LLM (Query Planner Safety Rule, Section 5)
+PII redaction (above)
+Prompt-injection handling (above)
+.env protection (Section 6)
+Secret scanning in CI
+Dependency scanning in CI
+Container scanning in CI
+Agent permission restrictions (CLAUDE.md, Section 10)
+```
+
+The trust boundary stays the same shape everywhere an LLM is involved:
+
+```
+LLM -> Plan -> Pydantic validation -> Deterministic Executor -> Read-only DB
+```
+
+## 17. Question Coverage Catalogue
+
+Document these as the evaluation/coverage catalogue — a way to check
+CCVIE actually answers a representative spread of question shapes, not a
+list of 15 separate features to build:
+
+```
+1. Counts and rankings
+2. Trends and time comparison
+3. Entity comparison
+4. Emerging issues
+5. What people are saying
+6. Specific lookup
+7. Drivers of a change
+8. Catalogue/graph facts
+9. Explain the system/alert
+10. Follow-ups
+11. Compound questions
+12. Ambiguous questions
+13. Entity profiles
+14. Semantic counts/trends
+15. Out-of-scope questions
+```
+
+Map every class onto the existing deterministic Simple-path routes and
+the approved Query Planner operations (Section 5); do not create a
+fifteenth bespoke code path for a fifteenth question class. The Coverage
+set (Section 7) is where this catalogue meets evaluation: one
+representative case per class, checked against whichever route or
+operation already claims to handle it.
+
+## 18. Scope Control
+
+Section 14's phases say *when* to build something. This section says
+*whether* to build it at all, so a real improvement idea does not quietly
+turn into unbounded scope. Classify every enhancement in this document
+into exactly one of three buckets, and do not promote an item to a
+higher bucket without saying why.
+
+**MUST — the capstone is not done without these:**
+
+```
+One PostgreSQL + pgvector, deep relational graph, multi-hop traversal
+Ingestion + validation
+Detection + low-volume policy, two baselines, FDR
+Deterministic router + confidence (Section 1)
+Query Planner + controlled executor
+Hybrid FTS + vector retrieval, evidence <= 45
+Citation validation + numeric verification
+Prompt-injection handling + PII handling
+Evaluation (Section 7), security scans (Section 16)
+Docker health checks, local rollback, runbook
+```
+
+**SHOULD — implement only after the MUST list works end to end:**
+
+```
+Cross-encoder reranking, MMR, embedding-model bake-off (Section 5)
+Advanced graph visualization
+Entity profiles (GET_PROFILE)
+BERTopic/HDBSCAN enhancements (docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md)
+```
+
+**COULD / FUTURE — explicitly out of the core capstone, documented as
+optional so nobody re-proposes them as if they were forgotten:**
+
+```
+MCP wrapper
+Neo4j adapter (or any dedicated graph database)
+Cloud deployment
+Semantic count estimation for unmapped concepts
+Multi-million-record scale testing
+Additional infrastructure/services
+```
+
+This document's core — PostgreSQL + pgvector, the deep-but-relational
+graph model, deterministic-first routing with a controlled Query
+Planner, evidence-backed generation with layered verification, and a
+measurable evaluation/CI gate — is not replaced by any of the
+improvements above. Every addition in Sections 1, 5, 6, 7, 16, and 17
+strengthens that same architecture; none of them substitutes a different
+one:
+
+```
+                CCVIE
+                  |
+       +----------+----------+
+       |                     |
+   DETECTION            INVESTIGATION
+       |                     |
+ PostgreSQL             LangGraph
+       |                     |
+ Poisson/NB          Query Understanding
+       |                     |
+ FDR / Baselines     Confidence Check
+       |                     |
+ Emerging Issue       Router / Planner
+                             |
+                       Controlled Executor
+                             |
+                   +---------+---------+
+                   |         |         |
+                  SQL      Graph     Vector
+                   |         |         |
+                   +---------+---------+
+                             v
+                          Evidence
+                             v
+                         Generation
+                             v
+                        Verification
+                             v
+                     DB-backed Citations
+                             v
+                             UI
+```

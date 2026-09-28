@@ -40,19 +40,23 @@ design and in code comments, even though they share tables and contracts:
 
 ```text
 DETECTION PIPELINE (scheduled, no user in the loop)
-Complaints -> Taxonomy -> Aggregation
-  baseline >= MIN_POISSON_BASELINE_COUNT -> Poisson Scan
+Complaints -> Daily aggregation cells (date/SKU/pack/region/issue/
+  component/supplier/plant) -> 7-day rolling window
+  baseline >= MIN_POISSON_BASELINE_COUNT -> Poisson or Negative Binomial scan
   baseline <  MIN_POISSON_BASELINE_COUNT -> Low-Volume Detection Policy
-  -> Emerging Issue (marked low-volume when the second branch fired)
+  -> Hierarchical roll-ups -> FDR control -> Emerging Issue
+     (marked low-volume when the second branch fired)
 
 INVESTIGATION PIPELINE (fires on a user query)
-User Query -> Deterministic Complexity Detector
-  Simple  -> Deterministic Intent Detection -> Router
+User Query -> Follow-up Rewrite -> Scope Check -> Entity Resolution
+  -> Deterministic Complexity + Confidence Check
+  Simple + high confidence -> Deterministic Intent Detection -> Router
              -> Graph / SQL / Vector / Hybrid
-  Complex -> LLM Query Planner -> Pydantic Validation -> Approved
-             Operations -> Deterministic Plan Executor
-             -> Graph / SQL / Vector / Hybrid
-  -> Evidence -> LLM Explanation -> Citation Validation
+  Complex, or Simple + low confidence -> LLM Query Planner -> Pydantic
+             Validation -> Approved Operations -> Deterministic Plan
+             Executor -> Graph / SQL / Vector / Hybrid
+  -> Evidence -> LLM Explanation -> Verification (citation + claim
+     support + numeric) -> Answer / Clarification / Partial / Refusal
 ```
 
 Both pipelines feed the Layer 4 Attribution UI: Detection produces the
@@ -68,15 +72,16 @@ Query Planner Safety Rule).
 
 **Tables:**
 - `taxonomy`: products, packs, regions, issue_types (from `seed.sql`)
-- `graph_nodes(id, label, props jsonb)` + `graph_edges(type, src, dst, props)` = a PostgreSQL-based relational property-graph model with GraphRAG-style retrieval: `graph_nodes`/`graph_edges` -> SQL-based graph traversal -> GraphRAG-style retrieval, with Issue nodes [blueprint requirement met without a dedicated graph database engine]. Canonical multi-hop example: `Issue -> Pack -> Region -> Related Issue` (see `project-architecture-proposal.md` Section 1). **Required indexes:** `graph_edges(src)` and `graph_edges(dst)` each need a B-tree index, created in `0001_init_entities.sql`, or multi-hop traversal degrades to sequential scans as depth grows - do not assume a foreign key column is indexed automatically, verify it explicitly. Do not index every JSONB property; index only the ones actually filtered or joined on.
+- `graph_nodes(id, label, props jsonb)` + `graph_edges(type, src, dst, props)` = a PostgreSQL-based property graph model with relational tables and SQL joins, with GraphRAG-style retrieval [blueprint requirement met without a dedicated graph database engine - never Neo4j]. **Deep domain ontology** (structure and relationships, not complaint records or counts): `Brand -> Product -> SKU -> Pack -> Component -> Supplier`, `SKU -> Plant`, `Product -> Ingredient`, `IssueType -> IssueCategory`, `City -> Region -> Market`, `Pack -replaced_by-> Pack`, `Pack -uses-> Component`, `Alert -> Pack/SKU/Component/Supplier/Plant/Region/IssueType`. Two canonical multi-hop examples: `Issue -> Pack -> Region -> Related Issue` and the deeper supply-chain traversal `Pack -> Component -> Supplier -> Other Components -> Other Packs -> SKU -> Brand` (see `project-architecture-proposal.md` Section 1), implemented with a PostgreSQL recursive CTE bounded by `GRAPH_TRAVERSAL_MAX_DEPTH`. **Required indexes:** `graph_edges(src)` and `graph_edges(dst)` each need a B-tree index, created in `0001_init_entities.sql`, or multi-hop traversal degrades to sequential scans as depth grows - do not assume a foreign key column is indexed automatically, verify it explicitly. Do not index every JSONB property; index only the ones actually filtered or joined on.
+- `audit_log(request_id, operation, parameters, row_count, latency, cost, plan, evidence_count, verification_result, created_at)` - backs the Observability log fields below; supports debugging, evaluation, cost measurement, agentic-AI traceability, and demo evidence (see `project-architecture-proposal.md` Section 16)
 - `verbatims(id, text)` + `verbatim_embeddings(verbatim_id, embedding vector(384), model_name, embedding_version)` - dimension and model name come from `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIMENSION` in `config.py`, the one source of truth (`all-MiniLM-L6-v2` outputs 384, not 768); `model_name` + `embedding_version` make a future embedding-model migration explicit
 - `low_coverage_queue(verbatim_id, taxonomy_coverage, flagged_at, processed)` - verbatims below taxonomy coverage threshold, unique index on `verbatim_id WHERE processed = FALSE` prevents duplicate flags
 - `taxonomy_proposals(topic_id, keywords, status, notes, created_at)` - candidate topics from BERTopic, awaiting human review
 - `insight_feedback(feedback_id, insight_id, decision, reason, user_id, created_at, metadata jsonb)` - Quality Manager decision log (`CONFIRM_ISSUE` / `DISMISS` / `FALSE_POSITIVE` / `INVESTIGATE`), keyed by `user_id` not email for a stable audit log, see Section 2 step 5
 
 **Jobs:**
-- `ingestion.py` - hourly batch + nightly low-coverage flagging job (flags `taxonomy_coverage < 0.3`, idempotent via `ON CONFLICT ... DO NOTHING`)
-- `detection.py` - Poisson scan when `baseline >= MIN_POISSON_BASELINE_COUNT`; below that, a deterministic low-volume policy (minimum-count and historical-context rules, not a second statistical model) that marks its result low-volume. Do not assume Poisson spike detection alone is sufficient at baseline = 0 or 1. Tested at baseline 0, 1, low, normal, and high-volume spike.
+- `ingestion.py` - hourly batch + nightly low-coverage flagging job (flags `taxonomy_coverage < 0.3`, idempotent via `ON CONFLICT ... DO NOTHING`) + ingestion-time PII redaction (email, phone, order number, names; `PII_REDACTION_ENABLED`) + treats complaint text as untrusted data, never as instructions, even where it contains injection-shaped text
+- `detection.py` - aggregates complaints into daily cells (date/SKU/pack/region/issue/component/supplier/plant), scans each cell's 7-day rolling window with Poisson, or Negative Binomial when over-dispersion requires it; below `MIN_POISSON_BASELINE_COUNT`, a deterministic low-volume policy (minimum-count and historical-context rules, not a second statistical model) marks its result low-volume. Rolls results up (`Issue Category -> Issue Type`, `Market -> Region -> City`, `Supplier -> Component -> Pack`) and applies Benjamini-Hochberg FDR control (`DETECTION_FDR_ALPHA`) across cells tested together before emitting an Emerging Issue. Lead time is measured as `detection_date - planted onset_date` against two baselines (existing monthly/category baseline + a stronger naive weekly SKU x region baseline without graph dimensions) - never a hardcoded expected-lead-time value. Do not assume Poisson spike detection alone is sufficient at baseline = 0 or 1. Tested at baseline 0, 1, low, normal, and high-volume spike.
 - `embeddings.py` - sentence-transformers `all-MiniLM-L6-v2`
 - HDBSCAN for clustering
 - `bertopic_enrichment.py` - daily supplemental BERTopic job, lowest priority after Poisson detection, Graph/Vector/SQL retrieval, evidence attribution, LLM generation, and evaluation/CI; runs when the low-coverage queue exceeds 50 items; seeded (torch/numpy/random) and version-logged for reproducibility; output is human-reviewed and non-blocking to the eval gate. Answers "what if an emerging issue doesn't fit the taxonomy?" If the timeline runs short, cut this job's implementation first; keep the `low_coverage_queue`/`taxonomy_proposals` schema either way. Detail: `docs/DETECTION_PIPELINE_IMPLEMENTATION_CORRECTED.md`.
@@ -86,7 +91,19 @@ Query Planner Safety Rule).
 ### Layer 2: Router [Player 2]
 **LangGraph + Pydantic**
 
-- **Input:** `QueryRequest` contract
+- **Input:** `QueryRequest` contract, after the Query Understanding front
+  end has already run (see `project-architecture-proposal.md` Section 1):
+  **Follow-up Rewrite** (a conversational follow-up like "And in the
+  South?" is rewritten against the prior turn's filters into a
+  self-contained query), **Scope Check** (against `scope.yaml`'s
+  supported brands/markets/date range/metrics and unsupported-topics
+  list - forecasting, medical/safety judgement, recall decisions,
+  personal data requests - refuse or redirect out-of-scope queries before
+  routing), and **Entity Resolution** (`Alias dictionary -> pg_trgm
+  similarity -> Embedding similarity -> Resolved entity`, no LLM as
+  first-line resolver; ask a clarification question if more than one
+  entity stays plausible, for example "flip cap" matching both "Flip Cap
+  v1" and "Flip Cap v2").
 - **Complexity Detector (`router/complexity.py`, deterministic, unit-tested, no LLM call):**
   runs first on every query. Signals: multiple requested actions, conjunctions
   such as "and"/"then", investigation language, cross-region requests,
@@ -94,14 +111,30 @@ Query Planner Safety Rule).
   another operation, multiple entities or dimensions. Default with no
   strong signal is `Simple`. Do not build a second LLM or BERT classifier
   to make this call.
+- **Confidence score.** Alongside Simple/Complex, compute a deterministic
+  confidence score from resolved-entity coverage, number of matching
+  intents, conflicting intent signals, ambiguity, and completeness of the
+  route's required parameters:
+
+  ```text
+  COMPLEX                                       -> Query Planner
+  SIMPLE + confidence >= ROUTER_CONFIDENCE_MIN  -> Deterministic Router
+  SIMPLE + confidence <  ROUTER_CONFIDENCE_MIN  -> Query Planner
+  ```
+
+  This is what fixes brittle keyword-router behavior: a `Simple` query
+  that only weakly or ambiguously matches one intent goes to the Query
+  Planner instead of a possibly-wrong deterministic guess. Still no LLM
+  decides Simple vs Complex; the confidence score is computed from the
+  same deterministic features.
 - **Complexity detection has absolute precedence over deterministic
   intent classification.** No intent feature runs until the complexity
-  detector has answered Simple or Complex:
+  and confidence check has answered:
 
   ```text
   User Query -> Deterministic Complexity Detector
       ↓
-  Is query COMPLEX?
+  Is query COMPLEX, or SIMPLE with low confidence?
       ├── YES -> Query Planner
       └── NO  -> Deterministic Intent Router
   ```
@@ -110,10 +143,15 @@ Query Planner Safety Rule).
   routed by the Simple path's intent rules below, even if it also
   contains a strong Simple-intent keyword. See the ambiguous example
   after the Simple path's precedence order.
-- **LangGraph flow:** `START -> load_context -> complexity_detector -> is_complex?`
+- **LangGraph flow:** `START -> load_context -> rewrite_followup ->
+  scope_check -> resolve_entities -> complexity_and_confidence ->
+  is_complex_or_low_confidence?`
   - `NO  -> deterministic_router -> execute_retrieval`
   - `YES -> query_planner -> validate_plan -> execute_plan -> collect_evidence`
-  - both branches rejoin at `-> generate -> validate_citations -> END`
+  - both branches rejoin at `-> generate -> verify (citations + claim
+    support + numeric) -> END` (`END` state is one of Answer,
+    Clarification, Partial Answer, or Refusal - see the Query
+    Understanding Pipeline in `project-architecture-proposal.md` Section 1)
 
 **Simple path**
 
@@ -149,7 +187,12 @@ Query Planner Safety Rule).
   `COUNT_COMPLAINTS`, `GET_COMPLAINT_TREND`, `SEARCH_SIMILAR_COMPLAINTS`,
   `FIND_REGIONS`, `GROUP_BY_REGION`, `COMPARE_REGIONS`, `GET_BASELINE`,
   `GET_HISTORICAL_BASELINE`, `GET_ISSUE_HISTORY`, `GET_PRODUCT_HISTORY`,
-  `GET_EVIDENCE`. An unknown operation is rejected, not executed.
+  `GET_EVIDENCE`, extended as the deep graph ontology and the Question
+  Coverage Catalogue need it - only once a deterministic backend function
+  backs the name (`project-architecture-proposal.md` Section 5):
+  `RESOLVE_ENTITIES`, `GET_SUPPLY_LINKS`, `EXPLAIN_CHANGE`, `LIST_ALERTS`,
+  `EXPLAIN_ALERT`, `GET_PROFILE`, `GET_THEMES`, `SEMANTIC_COUNT`. An
+  unknown operation is rejected, not executed.
 - **Example plan** for the query above: `RESOLVE_INSIGHT ->
   SEARCH_SIMILAR_COMPLAINTS -> FIND_REGIONS -> GROUP_BY_REGION ->
   COMPARE_REGIONS -> GET_EVIDENCE`.
@@ -181,8 +224,9 @@ Query Planner Safety Rule).
 
 - **Retrieval (Player 1 implements and optimizes; files live in `retrieval_gen/`, not moved into `data_foundation/` just to match ownership):** `graph_queries.py` [PostgreSQL-based relational property-graph model, GraphRAG-style retrieval, multi-hop example `Issue -> Pack -> Region -> Related Issue`] + `vector_queries.py` [pgvector] + `sql_queries.py` [aggregate ops, also the Complex-path executor's `COUNT_COMPLAINTS` target] - all asyncpg direct, read-only `ccvie_reader` role, NOT MCP for the detection or investigation pipeline (MCP stays out of the core path for both Simple and Complex queries; may be reconsidered later only for external agent interoperability, never added just for a demo). Player 2's `orchestrator.py` and `plan_executor.py` consume these as a dependency: `Player 1 -> Data + Retrieval Primitives -> Player 2 -> Planning + Orchestration + Generation`.
 - **Generation:** `llm.py` thin client, provider and model name only from `LLM_PROVIDER`/`LLM_MODEL_NAME` in `config.py` (provider-agnostic, no provider or model hardcoded anywhere else), prompt in `synthesize_insight.md` -> generates `InsightResponse` with up to `MAX_EVIDENCE_ITEMS` (45) `SourceRef` - a cap, not a required count. The same generation step runs for both the Simple and Complex path, over whatever `evidence.py` assembled.
+- **Hybrid Retrieval Design:** `Resolved-entity metadata filtering -> PostgreSQL full-text search + pgvector search -> Reciprocal Rank Fusion -> Top evidence`. Handle 0 matches safely (empty evidence -> Clarification/Refusal, never a fabricated result), not only the common case. Cross-encoder reranking, MMR, and an embedding-model bake-off are SHOULD-tier conditional enhancements (`project-architecture-proposal.md` Section 18) - document, do not block the core path, implement only if the Retrieval set (recall@20, nDCG@10) shows a real problem.
 - **Evidence Limit:** `top_k <= MAX_EVIDENCE_ITEMS`: 18 matches -> return 18, 45 matches -> return 45, 250 matches -> retrieve/rank the top 45. Never assume exactly 45.
-- **Citation Validation:** Retrieve evidence -> LLM generates Claim + Source IDs -> Citation Validator (`citation_validator.py`) checks every citation the response actually used exists and belongs to the evidence set actually retrieved for that query, whatever its size -> UI renders the verbatim text fetched directly from the database by ID, never the text the LLM produced, so a hallucinated quote cannot reach the Quality Manager
+- **Citation Validation:** Retrieve evidence -> LLM generates Claim + Source IDs -> Citation Validator (`citation_validator.py`) checks every citation the response actually used exists and belongs to the evidence set actually retrieved for that query, whatever its size -> UI renders the verbatim text fetched directly from the database by ID, never the text the LLM produced, so a hallucinated quote cannot reach the Quality Manager. **Evidence-set membership is necessary, not sufficient:** a lightweight NLI/support check (`Claim -> Retrieved Verbatim -> Support/Unsupported`) removes or downgrades-to-partial-answer any claim membership alone would have let through unsupported. **Numeric verification:** every number in a generated answer must trace back to a deterministic operation result (for example `COUNT_COMPLAINTS -> 45`); the LLM may explain a number, never invent one.
 - **Tools:** FastAPI, asyncpg, LLM client selected by `LLM_PROVIDER` (see `project-architecture-proposal.md` Section 6)
 
 ### Layer 4: Attribution UI [Player 4]
@@ -197,25 +241,31 @@ Query Planner Safety Rule).
 **Pytest + GitHub Actions**
 
 **Golden Sets:** `data/golden/`
-- `planted_issue_ground_truth.json` [20 planted issues]
+- `planted_issue_ground_truth.json` [20 planted issues, each with a planted **onset date**, not a hardcoded expected lead time - lead time is always measured as `detection_date - onset_date` against two baselines, see Layer 1]
 - `router_golden.jsonl` [120 queries, 2 annotators, kappa>0.65] - THIS WAS MISSING = M-4 CRITICAL. Must include queries matching more than one intent signal, to exercise the deterministic precedence order (Layer 2), not just the obvious single-intent cases: `COUNT` + `SEMANTIC_SEARCH`, `COUNT` + `COMPARISON`, `TREND` + `SEMANTIC_SEARCH`, `ENTITY_LOOKUP` + `RELATIONSHIP`, and a `COMPLEX`-classified query that also contains a strong Simple-intent keyword (for example "Count similar seal failures across regions") to confirm complexity detection still wins.
 - `eval_fixture.jsonl` [30 queries for citation]
 - complex investigation golden set (new, additional to router_golden.jsonl, feeds M-4b): multi-region investigation, similar-complaint investigation, historical comparison, trend + comparison, ambiguous queries, unsupported queries, missing-context queries, multi-step evidence requests
+- **coverage set:** one representative case per Question Coverage Catalogue class (`project-architecture-proposal.md` Section 17)
+- **citation set:** expected supporting `SourceRef` IDs plus labelled claim/verbatim pairs, for M-3 and the claim-support check
+- **numeric set:** count/trend/comparison/profile questions with a known-correct number, for numeric verification
+- **retrieval set:** measures `recall@20` and `nDCG@10` for hybrid retrieval, ablation where practical
+- **adversarial set:** prompt-injection attempts in complaint text, PII probes, unsupported products/entities, out-of-scope questions
+- **always-vector baseline:** every router golden-set query sent straight to vector retrieval, no routing - shows whether the deterministic router + Query Planner add real value over "just use vector search for everything"
 
 **Metrics:**
 - M-1 Detection Rate (Recall - did it catch the planted issue)
 - M-1b Precision and False-Positive Rate - did it also raise alerts that were not real issues; reported alongside M-1 so lead time cannot look good only because the system over-alerts
 - M-1c Alerts per day/week - answers "does this create alert fatigue"
-- M-2 Lead Time vs monthly baseline (Time-to-detection)
+- M-2 Lead Time (Time-to-detection), measured from the planted onset date, against two baselines: the naive monthly/category baseline and the stronger naive weekly SKU x region baseline (Layer 1) - never a hardcoded expected value
 - M-3 Citation Accuracy [ID match + evidence-set membership from the Citation Validator, Section 3 Layer 3 + optional RAGAS faithfulness offline]
 - M-4 Routing Correctness [accuracy + per-class recall, per intent] - Simple path only, unchanged by the planner addition
 - M-4b Investigation Plan Validity (Complex path, `planner_eval.py`): Valid Plan Rate, Operation Validity, Parameter Completeness, Plan Execution Success Rate, Unsupported Operation Rejection
 - E13 Cost/query - for the Complex path, `TOTAL_QUERY_COST` = `PLANNER_LLM_COST` + `EXECUTION_COST` + `GENERATION_COST` (retrieval cost is part of `EXECUTION_COST`); track Simple- and Complex-path cost separately, do not treat them as equivalent without identifying the query path; log `planner_llm_cost` and `total_query_cost` in observability, below
 - E14 Latency p50/p95
 
-**Gates:** `eval-gate.yml` fails the PR if any `_MIN` metric (citation accuracy, router accuracy, graph recall) falls below its threshold, or any `_MAX` metric (lead-time regression days, false-positive rate) rises above its threshold - see `project-architecture-proposal.md` Section 6 for the one source of truth on those `EVAL_*` values and the `_MIN`/`_MAX` direction. These checks cover the Poisson-based metrics only. The BERTopic enrichment job is supplemental: its results (topics found, human reviewed, added to taxonomy) are reported alongside the gate output but never block it. M-4b is reported the same way once the planner lands: visible in gate output, not blocking, until the team locks an `EVAL_PLANNER_*` threshold (Section 8).
+**Gates:** `eval-gate.yml` fails the PR if any `_MIN` metric (citation accuracy, router accuracy, graph recall) falls below its threshold, or any `_MAX` metric (lead-time regression days, false-positive rate) rises above its threshold - see `project-architecture-proposal.md` Section 6 for the one source of truth on those `EVAL_*` values and the `_MIN`/`_MAX` direction. These checks cover the Poisson-based metrics only. The BERTopic enrichment job is supplemental: its results (topics found, human reviewed, added to taxonomy) are reported alongside the gate output but never block it. M-4b is reported the same way once the planner lands: visible in gate output, not blocking, until the team locks an `EVAL_PLANNER_*` threshold (Section 8). The coverage/citation/numeric/retrieval/adversarial sets and the always-vector baseline comparison are reported the same way: visible, not gating, until the team locks a threshold to gate on.
 
-**Observability (Complex path):** log `request_id`, `query_complexity`, `selected_path`, `planner_model`, `plan_version`, `operations`, `validation_result`, `execution_duration`, `evidence_count`, `citation_validation_result`, `planner_llm_cost`, `execution_cost`, `total_query_cost`, `final_status`. Do not log unnecessary sensitive complaint content.
+**Observability (Complex path):** log `request_id`, `query_complexity`, `selected_path`, `planner_model`, `plan_version`, `operations`, `validation_result`, `execution_duration`, `evidence_count`, `citation_validation_result`, `planner_llm_cost`, `execution_cost`, `total_query_cost`, `final_status`. Do not log unnecessary sensitive complaint content. `audit_log` (Layer 1) is where this actually lands, durably.
 
 **Tools:** Pytest, GitHub Actions, RAGAS offline only [not in CI]
 
@@ -233,6 +283,8 @@ Query Planner Safety Rule).
 | **sentence-transformers** | Embeddings, no LLM call in detection | Keeps cost low per blueprint page 63; model + dimension pinned together in `config.py` |
 | **LLM_PROVIDER / LLM_MODEL_NAME** | Provider-agnostic LLM client for Layer 3 generation only | No provider or model name hardcoded outside `config.py`/`.env*`, required by proposal Section 6 |
 | **Deterministic complexity detector + LLM Query Planner** | Plans, never executes, a Complex investigation query; Simple queries never reach it | Keeps the deterministic router as the default path; LLM never touches SQL/graph/vector directly, see proposal Section 5 |
+| **Confidence score (Section 1) + `ROUTER_CONFIDENCE_MIN`** | Sends a `Simple`-but-low-confidence query to the Query Planner instead of a brittle keyword guess | Fixes brittle keyword-router failures without adding an LLM to the Simple/Complex decision |
+| **`audit_log` + security scans (Section 16)** | Durable trace of every operation/plan/cost/verification result; secret/dependency/container scanning in CI | Debugging, evaluation, cost measurement, agentic-AI traceability, and demo evidence in one place |
 | **Next.js + shadcn** | UI with attribution | Required for citation drill-down |
 | **Pytest + eval-gate** | CI that blocks regression | Proves M-1 to M-4 reliably, thresholds from `config.py` only |
 
@@ -241,37 +293,43 @@ Query Planner Safety Rule).
 ## 5. End-to-End Flow in 30 Seconds
 
 ```
-DETECTION: Consumer text -> ingestion.py -> graph_nodes/edges + embedding
-  -> detection.py: baseline >= MIN_POISSON_BASELINE_COUNT ? Poisson scan
-  detects spike in 3 days : deterministic low-volume policy marks the
-  result low-volume -> Emerging Issue card in UI
+DETECTION: Consumer text -> ingestion.py (PII redacted, untrusted text)
+  -> graph_nodes/edges + embedding -> detection.py aggregates into daily
+  cells, 7-day rolling window: baseline >= MIN_POISSON_BASELINE_COUNT ?
+  Poisson/Negative-Binomial scan detects spike in 3 days : deterministic
+  low-volume policy marks the result low-volume -> hierarchical roll-ups
+  -> Benjamini-Hochberg FDR control -> Emerging Issue card in UI, lead
+  time measured against two baselines from the planted onset date
 
-INVESTIGATION (Simple): Quality Manager query -> Complexity Detector
-  says Simple -> Deterministic Intent Detection -> Router decides Graph
-  vs Vector vs Hybrid -> Retrieval gets up to MAX_EVIDENCE_ITEMS (45)
-  verbatims, ranked by match strength, never padded to a fixed count ->
-  LLM generates insight with SourceRef -> Citation Validator checks
-  every citation actually used against the retrieved set -> UI shows
-  top 5 + [View all], with the real "Showing N of M" count, verbatim
-  text from DB -> Quality Manager records Confirm/Dismiss/False
-  Positive/Investigate -> Evaluation reports the measured lead-time
-  improvement, routing accuracy, false-positive rate, and cost/query
-  from that run (all thresholds from config.py; these are measured
-  values, not fixed demo numbers, and will change as the implementation
-  changes)
+INVESTIGATION (Simple): Quality Manager query -> Follow-up Rewrite ->
+  Scope Check -> Entity Resolution -> Complexity + Confidence says
+  Simple/high-confidence -> Deterministic Intent Detection -> Router
+  decides Graph vs Vector vs Hybrid -> Hybrid Retrieval (FTS + vector +
+  RRF) gets up to MAX_EVIDENCE_ITEMS (45) verbatims, ranked by match
+  strength, never padded to a fixed count -> LLM generates insight with
+  SourceRef -> Citation Validator + claim-support check + numeric
+  verification -> UI shows top 5 + [View all], with the real "Showing N
+  of M" count, verbatim text from DB -> Quality Manager records
+  Confirm/Dismiss/False Positive/Investigate -> Evaluation reports the
+  measured lead-time improvement, routing accuracy, false-positive rate,
+  and cost/query from that run (all thresholds from config.py; these are
+  measured values, not fixed demo numbers, and will change as the
+  implementation changes)
 
 INVESTIGATION (Complex): "Investigate this issue and see if similar
-  complaints occurred in other regions." -> Complexity Detector says
-  Complex -> LLM Query Planner produces InvestigationPlan
-  (RESOLVE_INSIGHT -> SEARCH_SIMILAR_COMPLAINTS -> FIND_REGIONS ->
-  GROUP_BY_REGION -> COMPARE_REGIONS -> GET_EVIDENCE) -> Pydantic
-  validation + approved-operations check -> plan_executor.py runs each
-  operation deterministically (Vector for similar complaints, SQL/Graph
-  multi-hop traversal - Issue -> Pack -> Region -> Related Issue - for
-  regional grouping and comparison, PostgreSQL for evidence) -> same
-  Generation + Citation Validation + UI as the Simple path -> Evaluation
-  reports M-4b plan validity plus the Complex-path cost breakdown
-  (PLANNER_LLM_COST + EXECUTION_COST + GENERATION_COST = TOTAL_QUERY_COST)
+  complaints occurred in other regions." -> Complexity + Confidence says
+  Complex (or Simple/low-confidence) -> LLM Query Planner produces
+  InvestigationPlan (RESOLVE_INSIGHT -> SEARCH_SIMILAR_COMPLAINTS ->
+  FIND_REGIONS -> GROUP_BY_REGION -> COMPARE_REGIONS -> GET_EVIDENCE) ->
+  Pydantic validation + approved-operations check -> plan_executor.py
+  runs each operation deterministically (Vector for similar complaints,
+  SQL/Graph multi-hop traversal - Issue -> Pack -> Region -> Related
+  Issue, or the deeper Pack -> Component -> Supplier -> Other Components
+  -> Other Packs -> SKU -> Brand supply-chain traversal - for regional
+  grouping and comparison, PostgreSQL for evidence) -> same Generation +
+  Verification + UI as the Simple path -> Evaluation reports M-4b plan
+  validity plus the Complex-path cost breakdown (PLANNER_LLM_COST +
+  EXECUTION_COST + GENERATION_COST = TOTAL_QUERY_COST)
 ```
 
 ## 6. Delivery Phases and Maturity
@@ -304,3 +362,12 @@ rollback demonstration stays a local Docker script, not a deployment
 pipeline. Put remaining time into GraphRAG correctness, low-volume
 detection, evidence limits, the Query Planner, evaluation, security
 boundaries, and local demo reliability instead.
+
+Every improvement documented in this file (deeper graph ontology,
+detection FDR/rollups, query understanding pipeline, confidence-scored
+routing, expanded planner operations, hybrid retrieval, claim/numeric
+verification, PII/prompt-injection handling, audit logging) is classified
+MUST, SHOULD, or COULD/FUTURE in `project-architecture-proposal.md`
+Section 18, Scope Control. MCP and a dedicated graph database (Neo4j or
+otherwise) stay explicitly COULD/FUTURE, documented as optional, never
+core capstone work.
