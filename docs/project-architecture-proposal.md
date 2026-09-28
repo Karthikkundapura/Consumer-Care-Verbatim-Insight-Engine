@@ -98,8 +98,8 @@ ambiguity.
 
 Describe the Layer 1 graph model with one wording, everywhere:
 
-> PostgreSQL-based relational property-graph model with GraphRAG-style
-> retrieval.
+> PostgreSQL-based property graph model with relational tables and SQL
+> joins, with GraphRAG-style retrieval.
 
 Never describe it as a dedicated graph database. The implementation is:
 
@@ -193,6 +193,48 @@ unnecessary sequential scans as traversal depth increases:
 Verification Plan checks this explicitly, not only architecturally, so
 a missing index cannot silently ship.
 
+**Panel-defense note, not a core architectural requirement.** The graph
+is not merely a collection of flat relational joins; the distinction
+that matters for a panel Q&A is this flow:
+
+```
+PostgreSQL
+    -> graph_nodes / graph_edges
+    -> bounded multi-hop graph traversal
+    -> structured graph context
+    -> evidence
+    -> LLM synthesis
+```
+
+An explicit domain graph (the ontology above) plus bounded multi-hop
+traversal is what makes this GraphRAG-style retrieval, not a name change
+on top of ordinary joins. Two panel questions and the recommended
+response to each, to keep the framing an honest trade-off rather than an
+absolute claim in either direction:
+
+> **"Isn't this just SQL graph modeling?"** Yes, our graph is implemented
+> using PostgreSQL relational adjacency tables rather than a dedicated
+> graph database. The important part for our use case is that we
+> maintain an explicit domain graph and perform bounded multi-hop graph
+> retrieval to obtain structured context that grounds the LLM's answer.
+> PostgreSQL is our implementation choice because it lets us keep graph
+> data, vector retrieval, and verbatim evidence in one operational data
+> platform without introducing another database. We validate this with
+> graph-specific planted issues and multi-hop retrieval tests.
+
+> **"Why not Neo4j?"** Neo4j is a valid alternative. We chose PostgreSQL
+> because our current graph depth and concurrency requirements can be
+> handled with indexed adjacency tables and bounded recursive traversal.
+> Graph access is kept behind a narrow, swappable interface, so a
+> dedicated graph engine could be introduced later if traversal depth or
+> scale required it — that is not on this capstone's roadmap (Section 18).
+
+Do not claim Neo4j is inferior. Do not claim PostgreSQL is universally
+better, and do not claim "GraphRAG is storage-independent" as an absolute
+statement. Frame the choice as an architectural trade-off and a scope
+decision for this project, every time this comes up — in this document,
+in the workflow doc, and in the demo script.
+
 ### Detection Pipeline Design
 
 The full Detection pipeline (Section 1's "Two Pipelines" diagram is the
@@ -214,13 +256,17 @@ daily cells keyed by the dimensions that actually matter for a recall:
 `date, SKU, pack, region, issue, component, supplier, plant`. A cell, not
 a raw complaint row, is what the statistical scan tests.
 
-**Statistical detection.** Poisson is the default test on a cell's 7-day
-rolling window. When a cell's historical counts are over-dispersed
-(variance meaningfully exceeds the mean — a standard dispersion check,
-not a new model family), `detection.py` uses a Negative Binomial test
-for that cell instead. This is a choice `detection.py` makes per cell
-automatically; it is not a second pipeline and does not need a separate
-config flag. Do not add a third statistical model beyond
+**Statistical detection.** Poisson plus the low-volume policy (below) is
+the MUST-tier baseline (Section 18) and, on its own, a complete working
+detector. When a cell's historical counts are over-dispersed (variance
+meaningfully exceeds the mean — a standard dispersion check, not a new
+model family), `detection.py` can use a Negative Binomial test for that
+cell instead; this is a SHOULD-tier refinement, added once the Poisson
+baseline is stable, not a Phase 1 dependency — if it is not operational
+yet, the validated Poisson scan is the fallback, not a gap (Section 14,
+Two-Week Delivery Guardrail). This is a choice `detection.py` makes per
+cell automatically; it is not a second pipeline and does not need a
+separate config flag. Do not add a third statistical model beyond
 Poisson/Negative Binomial/the low-volume policy below without evaluation
 evidence that these two are insufficient.
 
@@ -233,7 +279,11 @@ Region -> City`, `Supplier -> Component -> Pack`.
 **False Discovery Rate control.** Testing many cells and roll-ups
 simultaneously inflates false positives. Apply Benjamini-Hochberg FDR
 control across the set of cells tested in one run before emitting
-Emerging Issues, at `DETECTION_FDR_ALPHA` (Section 6).
+Emerging Issues, at `DETECTION_FDR_ALPHA` (Section 6). FDR control, the
+hierarchical roll-ups above, and the second (weekly SKU x region)
+baseline (Section 7) are SHOULD-tier layers on the MUST-tier single-cell,
+single-baseline detector — real improvements, added once Phase 1's
+end-to-end path is working, not before.
 
 ### Low-Volume Detection Policy
 
@@ -283,6 +333,15 @@ User Query
 
 Every stage here is deterministic or rule-based; none of them is a
 reason to add an LLM classifier.
+
+**Scope tiers (Section 18).** The Scope Check is MUST-tier: it is a
+`scope.yaml` lookup, cheap, and directly implements the prompt-injection
+and PII trust boundary, so it belongs in Phase 1. Follow-up Rewrite and
+the `pg_trgm`/embedding-similarity stages of Entity Resolution are
+SHOULD-tier refinements over a MUST-tier baseline (a single self-
+contained query with alias-dictionary-only resolution); if either
+refinement is not ready, the simpler baseline is the fallback, not a
+missing feature, per the Two-Week Delivery Guardrail (Section 14).
 
 **Follow-up rewrite.** A conversational follow-up ("And in the South?"
 after "What happened with seal failures?") is rewritten against the
@@ -1128,6 +1187,7 @@ this as a documented fallback in `docs/runbook.md`, not the default path.
 | A model name hardcoded outside config | Run the CI grep check from Section 6 on every pull request. |
 | Merge conflicts on the shared contract file | Lock the first version on Day 1. Require both Player 2 and Player 4 to approve any later change. Keep each change small. |
 | Missing indexes on `graph_edges(src)`/`graph_edges(dst)` cause sequential scans that slow multi-hop GraphRAG retrieval as traversal depth grows | Create both B-tree indexes in `0001_init_entities.sql`. Do not assume a foreign key column is automatically indexed; verify explicitly (Section 13). |
+| Scope exceeds delivery capacity: FDR control, Negative Binomial detection, recursive graph traversal, entity resolution, query rewriting, hybrid retrieval, reranking, MMR, NLI claim verification, PII redaction, prompt-injection handling, and the expanded evaluation sets could all individually consume implementation time and delay the working end-to-end system | Protect the Phase 1 golden path (Section 14, Two-Week Delivery Guardrail below); implement a simple validated version of each capability first; add advanced versions incrementally; measure improvement before retaining optional complexity; defer a non-critical component rather than let it block the end-to-end milestone. Priority order: `Working End-to-End System -> Correctness -> Evaluation -> Security/Operability -> Advanced Optimization`. |
 
 ## 13. Verification Plan
 
@@ -1175,6 +1235,53 @@ layer implementation to begin.
 The full architecture in this plan is larger than the timeline. Build it
 in this order. Do not start a later phase before the core end-to-end demo
 in Phase 1 through Phase 4 works.
+
+### Two-Week Delivery Guardrail
+
+This plan now documents several advanced capabilities: FDR control,
+Negative Binomial detection, recursive graph traversal, entity
+resolution, query rewriting, hybrid retrieval, reranking, MMR, NLI claim
+verification, PII redaction, prompt-injection handling, and the expanded
+evaluation sets. None of them may delay the first working end-to-end
+system. The primary Phase 1 objective stays exactly this, unchanged by
+every addition above it:
+
+```
+Data -> Detection -> Retrieval -> Evidence -> API -> UI
+```
+
+Implementation strategy: build the simplest valid implementation first,
+then add advanced capabilities incrementally, only after the core path
+works.
+
+**Fallback rule.** If an advanced capability threatens the Phase 1
+milestone, defer that capability and keep the simpler validated
+implementation it was going to replace — do not block on the advanced
+version, and do not delete the advanced capability from this document
+just because it is deferred; mark it incremental/conditional instead
+(Section 18, Scope Control, already does this for the SHOULD tier).
+Examples of a safe fallback, not a scope cut:
+
+```
+NLI verification unavailable
+    -> Source-ID membership validation + DB-backed verbatim rendering
+       (Section 5, Evidence and Citation Limit — already the baseline)
+
+Negative Binomial not operational
+    -> Validated Poisson + the existing low-volume policy
+       (Section 1, Detection Pipeline Design — already the baseline)
+
+Cross-encoder reranker not operational
+    -> FTS + vector retrieval + Reciprocal Rank Fusion
+       (Section 5, Hybrid Retrieval Design — already the baseline)
+```
+
+Do not invent an artificial deadline such as "must finish by Day 6" —
+none is defined in this plan, and adding one here would contradict
+Section 9's ADR-by-Day-2 and Day-1 contract-lock dates, which are the
+only fixed dates this plan sets. The one fixed principle: Phase 1
+end-to-end functionality takes priority over advanced optimization or
+verification components, every time the two compete for the same hours.
 
 1. **Phase 1 — Core path.** `Data -> Detection -> Retrieval -> Evidence ->
    API -> UI`: Data Foundation tables, the Poisson/low-volume detection
@@ -1314,24 +1421,41 @@ turn into unbounded scope. Classify every enhancement in this document
 into exactly one of three buckets, and do not promote an item to a
 higher bucket without saying why.
 
-**MUST — the capstone is not done without these:**
+**MUST — the capstone is not done without these.** Each of these already
+names its own simplest valid version; that version, not the advanced one
+next to it in SHOULD, is what Phase 1 needs:
 
 ```
-One PostgreSQL + pgvector, deep relational graph, multi-hop traversal
+One PostgreSQL + pgvector; one-hop graph traversal (Issue -> Pack ->
+  Region -> Related Issue), indexed (Section 1)
 Ingestion + validation
-Detection + low-volume policy, two baselines, FDR
+Detection: Poisson scan + the existing low-volume policy, one baseline
+Scope Check (scope.yaml) + alias-dictionary-only Entity Resolution
 Deterministic router + confidence (Section 1)
 Query Planner + controlled executor
-Hybrid FTS + vector retrieval, evidence <= 45
-Citation validation + numeric verification
+Hybrid retrieval: FTS + vector + Reciprocal Rank Fusion, evidence <= 45
+Citation validation (Source-ID exists + evidence-set membership +
+  DB-backed verbatim rendering) + numeric verification
 Prompt-injection handling + PII handling
 Evaluation (Section 7), security scans (Section 16)
 Docker health checks, local rollback, runbook
 ```
 
-**SHOULD — implement only after the MUST list works end to end:**
+**SHOULD — the advanced version of a MUST item above, or a genuinely
+optional addition; implement only after the MUST list works end to end,
+per the Two-Week Delivery Guardrail's fallback rule (Section 14):**
 
 ```
+Negative Binomial detection, when the MUST-tier Poisson scan shows
+  over-dispersion the evaluation flags as a real problem
+Deeper recursive multi-hop graph traversal (Pack -> Component -> Supplier
+  -> Other Components -> Other Packs -> SKU -> Brand) beyond the MUST
+  one-hop case, and its GRAPH_TRAVERSAL_MAX_DEPTH bound
+FDR control and the second (weekly SKU x region) baseline, layered onto
+  the MUST-tier single-baseline detection once it is stable
+Entity resolution (pg_trgm + embedding similarity) and Follow-up Rewrite,
+  beyond simple exact/alias matching
+NLI claim-support check, layered onto the MUST-tier citation validation
 Cross-encoder reranking, MMR, embedding-model bake-off (Section 5)
 Advanced graph visualization
 Entity profiles (GET_PROFILE)
